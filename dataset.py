@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from PIL import Image
 
+import random
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -146,6 +148,7 @@ def get_dataloader(
     def _worker_init_fn(worker_id: int):
         seed = torch.initial_seed() % (2 ** 32)
         np.random.seed(seed + worker_id)
+        random.seed(seed + worker_id)
 
     dataset_cls = FlatImageDataset if flat else ImageNetDataset
     dataset     = dataset_cls(root, split, resolution)

@@ -4,17 +4,21 @@ import torch.nn.functional as F
 
 class NoiseSchedule:
     """
-    VP noise scheduling. 
+    VP noise scheduling.
     alpha_t^2 + sigma_t^2 = 1
     lambda(t) = log(alpha_t^2 / sigma_t^2)
     alpha_t^2 = 1/ 1+ exp(lambda) = sigmoid(lambda), beta_t^2  = sigmoid(-lambda)
+
+    参数语义：
+        lambda_0: t=0 时的 log-SNR（高 SNR，低噪声，接近干净数据）
+        lambda_1: t=1 时的 log-SNR（低 SNR，高噪声，接近纯噪声）
     """
-    def __init__(self, lambda_min: float, lambda_max: float):
-        self.lambda_min = lambda_min
-        self.lambda_max = lambda_max
-    
+    def __init__(self, lambda_0: float, lambda_1: float):
+        self.lambda_0 = lambda_0
+        self.lambda_1 = lambda_1
+
     def log_snr(self, t: torch.Tensor) -> torch.Tensor:
-        return self.lambda_min + (self.lambda_max - self.lambda_min) * t
+        return self.lambda_0 + (self.lambda_1 - self.lambda_0) * t
     
     def alpha_sigma(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         lam = self.log_snr(t)
@@ -99,7 +103,7 @@ def diffusion_loss(
     # x-prediction 的连续时间 ELBO（Kingma VDM 2021, Eq.12）：
     #   L = ½ E_t [ |dλ/dt| · exp(λ) · ||x - x̂||² ]
     # linear schedule 下 -dλ/dt = λ_min - λ_max（正常数）
-    dlam_dt = schedule.lambda_min - schedule.lambda_max   # -dλ/dt，正数常数
+    dlam_dt = schedule.lambda_0 - schedule.lambda_1   # -dλ/dt，正数常数
     snr_weight = dlam_dt * torch.exp(lam) / 2             # [B]
 
     w = weight_fn(lam)                          # [B]，unweighted=1 或 sigmoid 值
@@ -115,7 +119,7 @@ def diffusion_loss(
 def kl_standard_normal(z_clean: torch.Tensor, schedule: NoiseSchedule) -> torch.Tensor:
     """
     KL[p(z_1|x) || N(0,I)] 的解析解。
-    实践中因为 lambda_max 很负，这项几乎为 0。
+    实践中因为 lambda_1 很负，这项几乎为 0。
     """
     t_one = torch.ones(z_clean.shape[0], device=z_clean.device)
     alpha1, sigma1 = schedule.alpha_sigma(t_one)
@@ -149,11 +153,11 @@ def add_latent_noise(z_clean: torch.Tensor, schedule: NoiseSchedule) -> torch.Te
     
     这是 UL 的核心设计之一：
     编码器输出确定性的 z_clean，然后在 t=0 处加固定噪声，
-    将编码器的精度与先验模型的最大精度对齐（lambda_min=5, sigma≈0.08）。
+    将编码器的精度与先验模型的最大精度对齐（lambda_0=5, sigma≈0.08）。
     
     Args:
         z_clean:  编码器输出的干净潜变量 [B, C, H, W]
-        schedule: 潜在空间的 noise schedule（lambda_min=5）
+        schedule: 潜在空间的 noise schedule（lambda_0=5）
         
     Returns:
         z_0: 带有固定噪声的潜变量，shape 与 z_clean 相同
@@ -185,22 +189,22 @@ def get_latent_schedule() -> NoiseSchedule:
     """
     潜在空间的 noise schedule。
     
-    lambda_min = 5  →  t=0 时 sigma ≈ 0.08（固定的小噪声）
-    lambda_max = -20 →  t=1 时接近纯高斯噪声
-    
+    lambda_0 = 5   →  t=0 时 sigma ≈ 0.08（固定的小噪声）
+    lambda_1 = -20 →  t=1 时接近纯高斯噪声
+
     这是 UL 论文的核心设定。
     """
-    return NoiseSchedule(lambda_min=5.0, lambda_max=-20.0)
+    return NoiseSchedule(lambda_0=5.0, lambda_1=-20.0)
 
 
 def get_image_schedule() -> NoiseSchedule:
     """
     图像空间的 noise schedule（用于扩散解码器）。
     
-    lambda_min = 10  →  t=0 时几乎是完全干净的图像
-    lambda_max = -20 →  t=1 时接近纯高斯噪声
+    lambda_0 = 10  →  t=0 时几乎是完全干净的图像
+    lambda_1 = -20 →  t=1 时接近纯高斯噪声
     """
-    return NoiseSchedule(lambda_min=10.0, lambda_max=-20.0)
+    return NoiseSchedule(lambda_0=10.0, lambda_1=-20.0)
 
 
 # ============================================================

@@ -134,6 +134,16 @@ class EMA:
         for k, v in model.state_dict().items():
             self.shadow[k].mul_(self.decay).add_(v, alpha=1 - self.decay)
 
+    def apply(self, model: nn.Module):
+        """将 EMA 权重加载到模型，备份原始权重供 restore 恢复。"""
+        self._backup = {k: v.clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow)
+
+    def restore(self, model: nn.Module):
+        """恢复 apply 前的原始训练权重。"""
+        model.load_state_dict(self._backup)
+        del self._backup
+
     def state_dict(self):
         return self.shadow
 
@@ -189,7 +199,7 @@ def load_checkpoint(path: str, models: dict, optimizers: dict = None,
     if emas:
         for k, v in emas.items():
             if k in ckpt['emas']:
-                v.shadow = ckpt['emas'][k]
+                v.shadow = {name: t.to(device) for name, t in ckpt['emas'][k].items()}
     return ckpt.get('step', 0)
 
 
@@ -217,8 +227,8 @@ def train_stage1(args, device: torch.device):
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     # ----- Noise Schedules -----
-    latent_schedule = get_latent_schedule()   # lambda_min=5（固定小噪声）
-    image_schedule  = get_image_schedule()    # lambda_min=10
+    latent_schedule = get_latent_schedule()   # lambda_0=5（固定小噪声）
+    image_schedule  = get_image_schedule()    # lambda_0=10
 
     enc_ch      = tuple(map(int, args.enc_channels.split(',')))
     dec_ch      = tuple(map(int, args.dec_channels.split(',')))
@@ -397,6 +407,12 @@ def train_stage1(args, device: torch.device):
             # 阶段一还没有 BaseModel，用先验模型临时替代做 latent 采样
             # 注意：阶段一的先验采样质量较差，仅用于观察解码器是否在学习
             
+            # 使用 EMA 权重做可视化
+            ema_prior.apply(prior)
+            ema_encoder.apply(encoder)
+            ema_decoder.apply(decoder)
+            prior.eval(); encoder.eval(); decoder.eval()
+
             grid = make_sample_grid(
                 base_model=prior,
                 decoder=decoder,
@@ -413,18 +429,11 @@ def train_stage1(args, device: torch.device):
             )
             save_image(grid, os.path.join(viz_dir, f"step_{step+1:07d}.png"))
             print(f"  [viz] 已保存样本网格 → {viz_dir}/step_{step+1:07d}.png")
-            
-            # 阶段一切换为重建验证模式
-            was_training_enc = encoder.training
-            was_training_dec = decoder.training
-            encoder.eval()
-            decoder.eval()
 
             # 从当前训练批次中截取部分真实图像作为基准
             viz_x = x[:args.viz_n_samples]
 
             with torch.no_grad():
-                # 直接测试从原图 -> 编码 -> 解码的完整信号通路
                 imgs = reconstruct(
                     encoder=encoder,
                     decoder=decoder,
@@ -437,8 +446,11 @@ def train_stage1(args, device: torch.device):
                     dtype=dtype,
                 )
 
-            encoder.train(was_training_enc)
-            decoder.train(was_training_dec)
+            # 恢复训练权重和模式
+            ema_prior.restore(prior)
+            ema_encoder.restore(encoder)
+            ema_decoder.restore(decoder)
+            prior.train(); encoder.train(); decoder.train()
 
             # 拼接：上方为真实原图，下方为解码器重建图，直观对比特征保真度
             comparison = torch.cat([viz_x, imgs], dim=0)
@@ -487,7 +499,7 @@ def train_stage2(args, device: torch.device):
       - 对 z_0 采样不同噪声级别，让 BaseModel 学会预测 z_clean
       - 损失用 sigmoid weighting（与阶段一的先验不同）
 
-    唯一区别：logsnr 的上界固定为 lambda_min=5（与阶段一的 latent schedule 一致），
+    唯一区别：logsnr 的上界固定为 lambda_0=5（与阶段一的 latent schedule 一致），
     而不是标准 LDM 里的自由超参。
     """
     if args.stage1_ckpt is None:
@@ -629,6 +641,8 @@ def train_stage2(args, device: torch.device):
         if args.viz_every > 0 and (step + 1) % args.viz_every == 0:
             viz_dir = os.path.join(args.output_dir, "viz")
             os.makedirs(viz_dir, exist_ok=True)
+            ema_base.apply(base_model)
+            base_model.eval()
             grid = make_sample_grid(
                 base_model=base_model,
                 decoder=decoder,
@@ -643,6 +657,8 @@ def train_stage2(args, device: torch.device):
                 device=device,
                 dtype=dtype,
             )
+            ema_base.restore(base_model)
+            base_model.train()
             save_image(grid, os.path.join(viz_dir, f"step_{step+1:07d}.png"))
             print(f"  [viz] 已保存样本网格 → {viz_dir}/step_{step+1:07d}.png")
 
