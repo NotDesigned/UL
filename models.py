@@ -92,13 +92,13 @@ def run_layers(layers: nn.ModuleList, x: torch.Tensor,
 
 
 def sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
-    """t ∈ [0,1] → sinusoidal embedding [B, dim]"""
+    """t ∈ [0,1] → sinusoidal embedding [B, dim]，内部缩放 1000× 以获得足够的频率分辨率。"""
     assert dim % 2 == 0
     half  = dim // 2
     freqs = torch.exp(
         -math.log(10000) * torch.arange(half, device=t.device) / half
     )
-    args  = t[:, None] * freqs[None, :]
+    args  = (t * 1000)[:, None] * freqs[None, :]
     return torch.cat([args.sin(), args.cos()], dim=-1)
 
 def interpolate_pos_embed(pos_embed: torch.Tensor, h: int, w: int) -> torch.Tensor:
@@ -241,9 +241,13 @@ class ViTBlock(nn.Module):
         self.mlp   = nn.Sequential(
             nn.Linear(dim, mlp_dim), nn.GELU(), nn.Linear(mlp_dim, dim)
         )
-        self.ada_ln = (nn.Sequential(nn.SiLU(),
-                                     nn.Linear(time_emb_dim, dim * 4))
-                       if time_emb_dim is not None else None)
+        if time_emb_dim is not None:
+            ada_linear = nn.Linear(time_emb_dim, dim * 4)
+            nn.init.zeros_(ada_linear.weight)
+            nn.init.zeros_(ada_linear.bias)
+            self.ada_ln = nn.Sequential(nn.SiLU(), ada_linear)
+        else:
+            self.ada_ln = None
 
     def forward(self, x: torch.Tensor,
                 t_emb: torch.Tensor = None) -> torch.Tensor:
@@ -303,7 +307,8 @@ class PriorModel(nn.Module):
         p      = self.patch_size
         tokens = self.proj_out(tokens)                        # [B,N,C*p*p]
         tokens = tokens.reshape(B, h, w, C, p, p)
-        return tokens.permute(0, 3, 1, 4, 2, 5).reshape(B, C, h*p, w*p)
+        residual = tokens.permute(0, 3, 1, 4, 2, 5).reshape(B, C, h*p, w*p)
+        return z_t + residual
 
 
 # ============================================================
@@ -438,7 +443,7 @@ class DiffusionDecoder(nn.Module):
             h    = self.up_layers[base + 1](h, t_emb)            # ResBlock
             h    = self.up_layers[base + 2](h, t_emb)            # ResBlock
 
-        return self.conv_out(F.silu(self.norm_out(h)))
+        return x_t + self.conv_out(F.silu(self.norm_out(h)))
 
 
 # ============================================================
@@ -510,5 +515,6 @@ class BaseModel(nn.Module):
         p      = self.patch_size
         tokens = self.proj_out(tokens)                    # [B,N,C*p*p]
         tokens = tokens.reshape(B, h, w, C, p, p)
-        return tokens.permute(0, 3, 1, 4, 2, 5).reshape(B, C, h*p, w*p)
+        residual = tokens.permute(0, 3, 1, 4, 2, 5).reshape(B, C, h*p, w*p)
+        return z_t + residual
 

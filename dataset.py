@@ -27,8 +27,6 @@ def get_transform(resolution: int = 512, split: str = 'train') -> transforms.Com
     验证集：中心裁剪（确定性，方便复现评测结果）
 
     输出范围：[-1, 1]，扩散模型的惯例。
-    ImageNet 的 mean/std normalize 不适用于扩散模型，
-    因为扩散模型假设数据分布接近标准正态，[-1,1] 线性缩放更符合这个假设。
     """
     if split == 'train':
         return transforms.Compose([
@@ -39,7 +37,6 @@ def get_transform(resolution: int = 512, split: str = 'train') -> transforms.Com
                                   [0.5, 0.5, 0.5]),         # → [-1, 1]
         ])
     else:
-        # 验证/测试：先缩放短边到略大于 resolution，再中心裁剪
         scale_size = int(resolution * 1.1)
         return transforms.Compose([
             transforms.Resize(scale_size),
@@ -64,8 +61,6 @@ class ImageNetDataset(Dataset):
             n01440764/   ← synset 文件夹
               xxx.JPEG
               ...
-            n01443537/
-              ...
           val/
             n01440764/
               ...
@@ -89,7 +84,6 @@ class ImageNetDataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        # 只返回图像，不返回类别标签（无条件生成）
         image, _ = self.dataset[idx]
         return image
 
@@ -133,7 +127,10 @@ def get_dataloader(
     batch_size: int = 16,
     num_workers: int = 8,
     flat: bool = False,
-) -> DataLoader:
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+):
     """
     创建 DataLoader。
 
@@ -144,7 +141,15 @@ def get_dataloader(
         batch_size:  批大小
         num_workers: 数据加载线程数
         flat:        True 表示使用 FlatImageDataset（无类别子目录）
+        distributed: 是否使用 DistributedSampler（DDP 模式）
+        rank:        当前进程的 rank
+        world_size:  总进程数
+
+    Returns:
+        (DataLoader, sampler) — sampler 为 DistributedSampler 或 None
     """
+    from torch.utils.data.distributed import DistributedSampler
+
     def _worker_init_fn(worker_id: int):
         seed = torch.initial_seed() % (2 ** 32)
         np.random.seed(seed + worker_id)
@@ -153,13 +158,21 @@ def get_dataloader(
     dataset_cls = FlatImageDataset if flat else ImageNetDataset
     dataset     = dataset_cls(root, split, resolution)
 
-    return DataLoader(
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+
+    shuffle = (split == 'train') if sampler is None else False
+
+    loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=(split == 'train'),
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
-        pin_memory=True,        # 加速 CPU→GPU 传输
-        drop_last=(split == 'train'),   # 训练时丢弃不完整的最后一个 batch
-        persistent_workers=(num_workers > 0),   # 避免每个 epoch 重建 worker
+        pin_memory=True,
+        drop_last=(split == 'train'),
+        persistent_workers=(num_workers > 0),
         worker_init_fn=_worker_init_fn,
     )
+    return loader, sampler

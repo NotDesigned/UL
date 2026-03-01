@@ -51,15 +51,18 @@ def loss_weight_unweighted(log_snr: torch.Tensor) -> torch.Tensor:
 def loss_weight_sigmoid(log_snr: torch.Tensor, shift: float = 0.0) -> torch.Tensor:
     """
     Sigmoid reweighted ELBO 权重。
-    
+
     w(lambda_t) = sigmoid(lambda_t - shift)
-    
+
     效果：
-      - 高 log-SNR（低噪声）区域权重大，鼓励模型关注细节
-      - 低 log-SNR（高噪声）区域权重小，降低低频结构的损失比重
-    
-    用于解码器（Decoder）的损失。
-    
+      - 高 log-SNR（低噪声）区域权重大：放大高 SNR 处本就较小的 MSE，
+        迫使编码器在潜变量中编码更多细节信息（anti posterior collapse）
+      - 低 log-SNR（高噪声）区域权重小：降低粗粒度去噪的损失比重，
+        该区域的学习主要由 exp(λ) ELBO 基础权重驱动
+
+    用于解码器（Decoder）的损失。与 loss_factor 配合，
+    共同控制编码器的信息编码压力。
+
     Args:
         log_snr: 当前时间步的 log-SNR，shape [B]
         shift:   sigmoid 的偏移量，对应论文中的 bias b

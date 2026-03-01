@@ -99,10 +99,6 @@ def _run_diffusion_loop(
             x_hat  = model_fn(x, t_b)
         x      = denoise_step(x_hat, x, t_now, t_next, schedule, eta)
 
-    # 最后一步直接取预测值，避免 t=0 时的数值误差
-    t_b   = torch.zeros(shape[0], device=device, dtype=dtype)
-    with torch.autocast(device_type=ac_device, dtype=dtype, enabled=use_autocast):
-        x     = model_fn(x, t_b)
     return x
 
 

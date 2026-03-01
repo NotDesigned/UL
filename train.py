@@ -4,8 +4,11 @@ Unified Latents (UL) - Training
 阶段二：冻结编码器/解码器，训练 BaseModel
 
 用法：
-  # 阶段一
+  # 阶段一（单卡）
   python train.py --stage 1 --data_root /path/to/imagenet --output_dir ./runs/stage1
+
+  # 阶段一（多卡）
+  torchrun --nproc_per_node=4 train.py --stage 1 --data_root /path/to/imagenet --output_dir ./runs/stage1
 
   # 阶段二（需要先完成阶段一）
   python train.py --stage 2 --data_root /path/to/imagenet \
@@ -16,10 +19,13 @@ Unified Latents (UL) - Training
 import os
 import math
 import argparse
+import contextlib
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 
@@ -35,6 +41,11 @@ from utils import (
     diffusion_loss, kl_standard_normal,
     loss_weight_unweighted, loss_weight_sigmoid,
 )
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 # ============================================================
@@ -61,21 +72,21 @@ def get_args():
     # 模型
     p.add_argument('--latent_channels', type=int, default=32)
     p.add_argument('--latent_size',     type=int, default=32)
-    p.add_argument('--enc_channels',    type=str, default='128,256,512,512', 
+    p.add_argument('--enc_channels',    type=str, default='128,256,512,512',
                    help='Encoder 的各阶段通道数配置')
-    p.add_argument('--dec_channels',    type=str, default='128,256,512', 
+    p.add_argument('--dec_channels',    type=str, default='128,256,512',
                    help='Decoder 下采样与上采样的卷积通道配置')
-    p.add_argument('--base_dims',       type=str, default='512,1024', 
+    p.add_argument('--base_dims',       type=str, default='512,1024',
                    help='BaseModel 两阶段 ViT 的特征维度')
-    p.add_argument('--embed_dim',       type=int, default=1024, 
+    p.add_argument('--embed_dim',       type=int, default=1024,
                    help='全局 ViT 的核心注意力维度')
-    p.add_argument('--vit_blocks',      type=int, default=8, 
+    p.add_argument('--vit_blocks',      type=int, default=8,
                    help='PriorModel 与 Decoder 的 ViT 块数量')
-    p.add_argument('--base_blocks',     type=str, default='6,16', 
+    p.add_argument('--base_blocks',     type=str, default='6,16',
                    help='BaseModel 两阶段的 ViT 块数量')
-    p.add_argument('--vit_heads',       type=int, default=16, 
+    p.add_argument('--vit_heads',       type=int, default=16,
                    help='PriorModel 与 Decoder 中 ViT 的多头注意力头数')
-    p.add_argument('--base_heads',      type=str, default='8,16', 
+    p.add_argument('--base_heads',      type=str, default='8,16',
                    help='BaseModel 两阶段 ViT 的多头注意力头数')
 
     # 训练超参
@@ -84,6 +95,8 @@ def get_args():
     p.add_argument('--warmup_steps', type=int,   default=5_000)
     p.add_argument('--grad_clip',    type=float, default=1.0)
     p.add_argument('--ema_decay',    type=float, default=0.9999)
+    p.add_argument('--grad_accum',   type=int,   default=1,
+                   help='梯度累积步数（有效 batch = batch_size × grad_accum × world_size）')
 
     # UL 超参（控制 latent bitrate）
     p.add_argument('--loss_factor',   type=float, default=1.5,
@@ -104,6 +117,14 @@ def get_args():
     p.add_argument('--resume',       type=str,   default=None,
                    help='从检查点恢复训练')
 
+    # WandB
+    p.add_argument('--wandb',        action='store_true',
+                   help='启用 WandB 日志')
+    p.add_argument('--wandb_project', type=str, default='ul',
+                   help='WandB 项目名称')
+    p.add_argument('--wandb_run',    type=str, default=None,
+                   help='WandB 运行名称（默认自动生成）')
+
     # 其他
     p.add_argument('--seed',         type=int,   default=42)
     p.add_argument('--mixed_precision', action='store_true',
@@ -113,6 +134,38 @@ def get_args():
                    help='可视化采样器类型')
 
     return p.parse_args()
+
+
+# ============================================================
+# DDP 辅助
+# ============================================================
+
+def setup_distributed():
+    """检测并初始化分布式训练环境（torchrun 启动时自动设置环境变量）。"""
+    if 'RANK' not in os.environ:
+        return 0, 1, 0
+
+    rank       = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(local_rank)
+
+    return rank, world_size, local_rank
+
+
+def unwrap(model):
+    """获取 DDP 包装下的原始模型。"""
+    return model.module if hasattr(model, 'module') else model
+
+
+def _ddp_no_sync(model):
+    """DDP 模型跳过梯度同步（用于非累积边界的 micro-step）。"""
+    if hasattr(model, 'no_sync'):
+        return model.no_sync()
+    return contextlib.nullcontext()
+
 
 # ============================================================
 # EMA（指数移动平均）
@@ -166,10 +219,11 @@ def get_lr(step: int, total_steps: int, warmup_steps: int, base_lr: float) -> fl
 def save_checkpoint(path: str, step: int, models: dict,
                     optimizers: dict, emas: dict, args,
                     keep_last: int = 3):
+    # 保存时使用 unwrapped 模型
     torch.save({
         'step':       step,
         'args':       vars(args),
-        'models':     {k: v.state_dict() for k, v in models.items()},
+        'models':     {k: unwrap(v).state_dict() for k, v in models.items()},
         'optimizers': {k: v.state_dict() for k, v in optimizers.items()},
         'emas':       {k: v.state_dict() for k, v in emas.items()},
     }, path)
@@ -191,7 +245,7 @@ def load_checkpoint(path: str, models: dict, optimizers: dict = None,
                     emas: dict = None, device: torch.device = None):
     ckpt = torch.load(path, map_location=device, weights_only=True)
     for k, v in models.items():
-        v.load_state_dict(ckpt['models'][k])
+        unwrap(v).load_state_dict(ckpt['models'][k])
     if optimizers:
         for k, v in optimizers.items():
             if k in ckpt['optimizers']:
@@ -207,7 +261,7 @@ def load_checkpoint(path: str, models: dict, optimizers: dict = None,
 # 阶段一：联合训练
 # ============================================================
 
-def train_stage1(args, device: torch.device):
+def train_stage1(args, device: torch.device, rank: int, world_size: int, local_rank: int):
     """
     联合训练编码器、先验、解码器。
 
@@ -223,8 +277,11 @@ def train_stage1(args, device: torch.device):
 
     两个损失相加，统一反传。
     """
-    print("=== 阶段一：联合训练编码器 + 先验 + 解码器 ===")
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    is_main = (rank == 0)
+
+    if is_main:
+        print("=== 阶段一：联合训练编码器 + 先验 + 解码器 ===")
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     # ----- Noise Schedules -----
     latent_schedule = get_latent_schedule()   # lambda_0=5（固定小噪声）
@@ -232,11 +289,11 @@ def train_stage1(args, device: torch.device):
 
     enc_ch      = tuple(map(int, args.enc_channels.split(',')))
     dec_ch      = tuple(map(int, args.dec_channels.split(',')))
-    
+
     # ----- 模型 -----
     encoder = Encoder(
-        in_channels=3, 
-        latent_channels=args.latent_channels, 
+        in_channels=3,
+        latent_channels=args.latent_channels,
         channel_mults=enc_ch
     ).to(device)
     prior = PriorModel(
@@ -244,10 +301,8 @@ def train_stage1(args, device: torch.device):
         latent_size=args.latent_size,
         embed_dim=args.embed_dim,
         n_blocks=args.vit_blocks,
-        n_heads=args.vit_heads      # 必须确保 args.embed_dim % args.vit_heads == 0
+        n_heads=args.vit_heads
     ).to(device)
-    
-    # 提示：在此前的修改中，Decoder 也需要同步接收头数参数
     decoder = DiffusionDecoder(
         in_channels=3, out_channels=3,
         latent_channels=args.latent_channels,
@@ -256,16 +311,21 @@ def train_stage1(args, device: torch.device):
         conv_channels=dec_ch,
         embed_dim=args.embed_dim,
         n_blocks=args.vit_blocks,
-        n_heads=args.vit_heads      # 同步传递给解码器中的 ViT 中间层
+        n_heads=args.vit_heads
     ).to(device)
 
-    # ----- EMA -----
-    ema_encoder = EMA(encoder, args.ema_decay)
-    ema_prior   = EMA(prior,   args.ema_decay)
-    ema_decoder = EMA(decoder, args.ema_decay)
+    # ----- DDP 包装 -----
+    if world_size > 1:
+        encoder = DDP(encoder, device_ids=[local_rank])
+        prior   = DDP(prior,   device_ids=[local_rank])
+        decoder = DDP(decoder, device_ids=[local_rank])
+
+    # ----- EMA（基于 unwrapped 模型）-----
+    ema_encoder = EMA(unwrap(encoder), args.ema_decay)
+    ema_prior   = EMA(unwrap(prior),   args.ema_decay)
+    ema_decoder = EMA(unwrap(decoder), args.ema_decay)
 
     # ----- 优化器 -----
-    # 三个模型用同一个优化器，梯度统一管理
     all_params = (list(encoder.parameters()) +
                   list(prior.parameters()) +
                   list(decoder.parameters()))
@@ -273,19 +333,21 @@ def train_stage1(args, device: torch.device):
                                   betas=(0.9, 0.99), weight_decay=1e-4)
 
     # ----- 混合精度 -----
-    # bf16 比 fp16 更稳定（无需 loss scaling），推荐在 Ampere+ 卡上使用
     dtype  = torch.bfloat16 if args.mixed_precision else torch.float32
     scaler = GradScaler(enabled=(args.mixed_precision and dtype == torch.float16))
 
     # ----- 数据 -----
-    loader = get_dataloader(
+    loader, sampler = get_dataloader(
         root=args.data_root, split='train',
         resolution=args.resolution,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         flat=args.flat_data,
+        distributed=(world_size > 1),
+        rank=rank,
+        world_size=world_size,
     )
-    loader_iter = _infinite_loader(loader)
+    loader_iter = _infinite_loader(loader, sampler)
 
     # ----- 恢复检查点 -----
     start_step = 0
@@ -298,12 +360,20 @@ def train_stage1(args, device: torch.device):
                   'decoder': ema_decoder},
             device=device,
         )
-        print(f"[resume] 从 step {start_step} 继续训练")
+        if is_main:
+            print(f"[resume] 从 step {start_step} 继续训练")
+
+    # ----- WandB -----
+    if is_main and args.wandb:
+        wandb.init(project=args.wandb_project, name=args.wandb_run,
+                   config=vars(args))
 
     # ----- 训练循环 -----
     encoder.train(); prior.train(); decoder.train()
     log_losses = {'prior': 0.0, 'decoder': 0.0, 'kl': 0.0, 'total': 0.0}
     log_count  = 0
+
+    optimizer.zero_grad()
 
     for step in range(start_step, args.total_steps):
 
@@ -322,11 +392,6 @@ def train_stage1(args, device: torch.device):
 
             # ==========================================
             # 先验损失（unweighted ELBO）
-            # ------------------------------------------
-            # 对 z_clean 采样不同噪声级别的 z_t，
-            # 让先验模型学会从任意噪声级别预测干净潜变量。
-            # 梯度流回编码器：编码器被迫产生"结构化"的潜变量，
-            # 使先验更容易建模。
             # ==========================================
             t_prior   = sample_timesteps(B, device)
             z_t, _    = latent_schedule.forward_noise(z_clean, t_prior)
@@ -335,21 +400,17 @@ def train_stage1(args, device: torch.device):
             loss_prior = diffusion_loss(
                 z_clean, z_hat, t_prior,
                 schedule=latent_schedule,
-                weight_fn=loss_weight_unweighted,   # 必须 unweighted
+                weight_fn=loss_weight_unweighted,
                 loss_factor=1.0,
             )
 
-            # KL[p(z_1|x) || N(0,I)]：z_1 几乎是纯噪声，这项接近 0
-            # 保留它是为了完整的 ELBO，实践中权重很小
+            # KL[p(z_1|x) || N(0,I)]
             loss_kl = kl_standard_normal(z_clean, latent_schedule)
 
             # ==========================================
             # 解码器损失（sigmoid reweighted ELBO）
-            # ------------------------------------------
-            # z_0：对 z_clean 加 t=0 处的固定小噪声（sigma ≈ 0.08）
-            # 这是 UL 的关键设计：将编码器的精度与先验的最大精度对齐
             # ==========================================
-            z_0       = add_latent_noise(z_clean, latent_schedule)  # 固定 t=0 噪声
+            z_0       = add_latent_noise(z_clean, latent_schedule)
 
             t_dec     = sample_timesteps(B, device)
             x_t, _    = image_schedule.forward_noise(x, t_dec)
@@ -359,7 +420,7 @@ def train_stage1(args, device: torch.device):
                 x, x_hat, t_dec,
                 schedule=image_schedule,
                 weight_fn=lambda lam: loss_weight_sigmoid(lam, args.sigmoid_shift),
-                loss_factor=args.loss_factor,       # 放大解码器损失，防 posterior collapse
+                loss_factor=args.loss_factor,
             )
 
             # ==========================================
@@ -367,18 +428,23 @@ def train_stage1(args, device: torch.device):
             # ==========================================
             loss = loss_prior + loss_kl + loss_dec
 
-        # 反传
-        optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(all_params, args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+        # 反传（梯度累积）
+        is_accum_step = (step + 1) % args.grad_accum == 0
+        sync_context = contextlib.nullcontext if (is_accum_step or world_size == 1) else _ddp_no_sync
+        with sync_context(encoder), sync_context(prior), sync_context(decoder):
+            scaler.scale(loss / args.grad_accum).backward()
 
-        # EMA 更新
-        ema_encoder.update(encoder)
-        ema_prior.update(prior)
-        ema_decoder.update(decoder)
+        if is_accum_step:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(all_params, args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+            # EMA 更新（基于 unwrapped 模型）
+            ema_encoder.update(unwrap(encoder))
+            ema_prior.update(unwrap(prior))
+            ema_decoder.update(unwrap(decoder))
 
         # 记录
         log_losses['prior']   += loss_prior.item()
@@ -387,7 +453,7 @@ def train_stage1(args, device: torch.device):
         log_losses['total']   += loss.item()
         log_count += 1
 
-        if (step + 1) % args.log_every == 0:
+        if (step + 1) % args.log_every == 0 and is_main:
             avg = {k: v / log_count for k, v in log_losses.items()}
             print(
                 f"[step {step+1:>7d}] "
@@ -397,46 +463,35 @@ def train_stage1(args, device: torch.device):
                 f"dec={avg['decoder']:.4f} | "
                 f"kl={avg['kl']:.10f}"
             )
+            if args.wandb:
+                wandb.log({
+                    'loss/total': avg['total'],
+                    'loss/prior': avg['prior'],
+                    'loss/decoder': avg['decoder'],
+                    'loss/kl': avg['kl'],
+                    'lr': lr,
+                }, step=step + 1)
             log_losses = {k: 0.0 for k in log_losses}
             log_count  = 0
 
-        # 训练中可视化
-        if args.viz_every > 0 and (step + 1) % args.viz_every == 0:
+        # 训练中可视化（仅重建对比，阶段一的先验采样质量较差故省略）
+        if args.viz_every > 0 and (step + 1) % args.viz_every == 0 and is_main:
             viz_dir = os.path.join(args.output_dir, "viz")
             os.makedirs(viz_dir, exist_ok=True)
-            # 阶段一还没有 BaseModel，用先验模型临时替代做 latent 采样
-            # 注意：阶段一的先验采样质量较差，仅用于观察解码器是否在学习
-            
-            # 使用 EMA 权重做可视化
-            ema_prior.apply(prior)
-            ema_encoder.apply(encoder)
-            ema_decoder.apply(decoder)
-            prior.eval(); encoder.eval(); decoder.eval()
 
-            grid = make_sample_grid(
-                base_model=prior,
-                decoder=decoder,
-                latent_schedule=latent_schedule,
-                image_schedule=image_schedule,
-                n_samples=args.viz_n_samples,
-                latent_channels=args.latent_channels,
-                latent_size=args.latent_size,
-                resolution=args.resolution,
-                n_steps=args.viz_steps,
-                sampler=args.sampler,
-                device=device,
-                dtype=dtype,
-            )
-            save_image(grid, os.path.join(viz_dir, f"step_{step+1:07d}.png"))
-            print(f"  [viz] 已保存样本网格 → {viz_dir}/step_{step+1:07d}.png")
+            enc_raw = unwrap(encoder)
+            dec_raw = unwrap(decoder)
 
-            # 从当前训练批次中截取部分真实图像作为基准
+            ema_encoder.apply(enc_raw)
+            ema_decoder.apply(dec_raw)
+            enc_raw.eval(); dec_raw.eval()
+
             viz_x = x[:args.viz_n_samples]
 
             with torch.no_grad():
                 imgs = reconstruct(
-                    encoder=encoder,
-                    decoder=decoder,
+                    encoder=enc_raw,
+                    decoder=dec_raw,
                     images=viz_x,
                     latent_schedule=latent_schedule,
                     image_schedule=image_schedule,
@@ -446,23 +501,25 @@ def train_stage1(args, device: torch.device):
                     dtype=dtype,
                 )
 
-            # 恢复训练权重和模式
-            ema_prior.restore(prior)
-            ema_encoder.restore(encoder)
-            ema_decoder.restore(decoder)
-            prior.train(); encoder.train(); decoder.train()
+            ema_encoder.restore(enc_raw)
+            ema_decoder.restore(dec_raw)
+            enc_raw.train(); dec_raw.train()
 
-            # 拼接：上方为真实原图，下方为解码器重建图，直观对比特征保真度
             comparison = torch.cat([viz_x, imgs], dim=0)
-            grid = torchvision.utils.make_grid(
+            recon_grid = torchvision.utils.make_grid(
                 comparison.float().cpu() * 0.5 + 0.5,
-                nrow=viz_x.shape[0],  # 每行显示同一批次的图
+                nrow=viz_x.shape[0],
                 padding=2,
             )
-            save_image(grid, os.path.join(viz_dir, f"step_{step+1:07d}_recon.png"))
+            save_image(recon_grid, os.path.join(viz_dir, f"step_{step+1:07d}_recon.png"))
             print(f"  [viz] 已保存重建对比网格 → {viz_dir}/step_{step+1:07d}_recon.png")
 
-        if (step + 1) % args.save_every == 0:
+            if args.wandb:
+                wandb.log({
+                    'reconstruction': wandb.Image(recon_grid),
+                }, step=step + 1)
+
+        if (step + 1) % args.save_every == 0 and is_main:
             save_checkpoint(
                 path=os.path.join(args.output_dir, f'ckpt_{step+1:07d}.pt'),
                 step=step + 1,
@@ -474,39 +531,34 @@ def train_stage1(args, device: torch.device):
             )
 
     # 最终检查点
-    save_checkpoint(
-        path=os.path.join(args.output_dir, 'ckpt_final.pt'),
-        step=args.total_steps,
-        models={'encoder': encoder, 'prior': prior, 'decoder': decoder},
-        optimizers={'optimizer': optimizer},
-        emas={'encoder': ema_encoder, 'prior': ema_prior, 'decoder': ema_decoder},
-        args=args,
-    )
-    print("阶段一训练完成。")
+    if is_main:
+        save_checkpoint(
+            path=os.path.join(args.output_dir, 'ckpt_final.pt'),
+            step=args.total_steps,
+            models={'encoder': encoder, 'prior': prior, 'decoder': decoder},
+            optimizers={'optimizer': optimizer},
+            emas={'encoder': ema_encoder, 'prior': ema_prior, 'decoder': ema_decoder},
+            args=args,
+        )
+        print("阶段一训练完成。")
 
 
 # ============================================================
 # 阶段二：训练 BaseModel
 # ============================================================
 
-def train_stage2(args, device: torch.device):
+def train_stage2(args, device: torch.device, rank: int, world_size: int, local_rank: int):
     """
     冻结编码器和解码器，只训练 BaseModel。
-
-    阶段二的训练几乎等同于标准 LDM 的训练：
-      - 用冻结的编码器把图像批量编码为 z_clean
-      - 对 z_clean 加 t=0 固定噪声得到 z_0
-      - 对 z_0 采样不同噪声级别，让 BaseModel 学会预测 z_clean
-      - 损失用 sigmoid weighting（与阶段一的先验不同）
-
-    唯一区别：logsnr 的上界固定为 lambda_0=5（与阶段一的 latent schedule 一致），
-    而不是标准 LDM 里的自由超参。
     """
+    is_main = (rank == 0)
+
     if args.stage1_ckpt is None:
         raise ValueError("阶段二需要通过 --stage1_ckpt 指定阶段一的检查点路径。")
 
-    print("=== 阶段二：训练 BaseModel ===")
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    if is_main:
+        print("=== 阶段二：训练 BaseModel ===")
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     latent_schedule = get_latent_schedule()
 
@@ -518,8 +570,8 @@ def train_stage2(args, device: torch.device):
 
     # ----- 加载阶段一的编码器和解码器（冻结）-----
     encoder = Encoder(
-        in_channels=3, 
-        latent_channels=args.latent_channels, 
+        in_channels=3,
+        latent_channels=args.latent_channels,
         channel_mults=enc_ch
     ).to(device)
 
@@ -533,7 +585,7 @@ def train_stage2(args, device: torch.device):
         n_blocks=args.vit_blocks,
         n_heads=args.vit_heads
     ).to(device)
-    
+
     load_checkpoint(args.stage1_ckpt,
                     models={'encoder': encoder, 'decoder': decoder},
                     device=device)
@@ -541,7 +593,8 @@ def train_stage2(args, device: torch.device):
         m.eval()
         for p in m.parameters():
             p.requires_grad_(False)
-    print(f"[stage2] 编码器和解码器已从 {args.stage1_ckpt} 加载并冻结。")
+    if is_main:
+        print(f"[stage2] 编码器和解码器已从 {args.stage1_ckpt} 加载并冻结。")
 
     image_schedule = get_image_schedule()
 
@@ -553,7 +606,12 @@ def train_stage2(args, device: torch.device):
         stage_blocks=base_blocks,
         n_heads=base_heads
     ).to(device)
-    ema_base   = EMA(base_model, args.ema_decay)
+
+    # ----- DDP 包装 -----
+    if world_size > 1:
+        base_model = DDP(base_model, device_ids=[local_rank])
+
+    ema_base   = EMA(unwrap(base_model), args.ema_decay)
 
     optimizer = torch.optim.AdamW(
         base_model.parameters(), lr=args.lr,
@@ -563,14 +621,17 @@ def train_stage2(args, device: torch.device):
     dtype  = torch.bfloat16 if args.mixed_precision else torch.float32
     scaler = GradScaler(enabled=(args.mixed_precision and dtype == torch.float16))
 
-    loader = get_dataloader(
+    loader, sampler = get_dataloader(
         root=args.data_root, split='train',
         resolution=args.resolution,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         flat=args.flat_data,
+        distributed=(world_size > 1),
+        rank=rank,
+        world_size=world_size,
     )
-    loader_iter = _infinite_loader(loader)
+    loader_iter = _infinite_loader(loader, sampler)
 
     start_step = 0
     if args.resume:
@@ -582,9 +643,16 @@ def train_stage2(args, device: torch.device):
             device=device,
         )
 
+    # ----- WandB -----
+    if is_main and args.wandb:
+        wandb.init(project=args.wandb_project, name=args.wandb_run,
+                   config=vars(args))
+
     base_model.train()
     log_loss  = 0.0
     log_count = 0
+
+    optimizer.zero_grad()
 
     for step in range(start_step, args.total_steps):
 
@@ -597,15 +665,10 @@ def train_stage2(args, device: torch.device):
 
         with autocast(device_type=device.type, dtype=dtype):
 
-            # 编码器不参与梯度计算
             with torch.no_grad():
                 z_clean = encoder(x)
-                # z_0：加固定 t=0 噪声，这是 BaseModel 的训练目标
                 z_0 = add_latent_noise(z_clean, latent_schedule)
 
-            # 对 z_0 采样不同噪声级别，BaseModel 学会从任意 z_t 预测 z_0
-            # 注意：BaseModel 预测的是 z_0（略带噪声的潜变量），而非 z_clean
-            # 这与阶段一的先验预测 z_clean 不同，与论文 Sec.3.3 一致
             t      = sample_timesteps(B, device)
             z_t, _ = latent_schedule.forward_noise(z_0, t)
             z_hat  = base_model(z_t, t)
@@ -614,37 +677,50 @@ def train_stage2(args, device: torch.device):
                 z_0, z_hat, t,
                 schedule=latent_schedule,
                 weight_fn=lambda lam: loss_weight_sigmoid(lam, args.sigmoid_shift),
-                loss_factor=1.0,    # 阶段二不需要 loss_factor
+                loss_factor=1.0,
             )
 
-        optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        ema_base.update(base_model)
+        # 反传（梯度累积）
+        is_accum_step = (step + 1) % args.grad_accum == 0
+        sync_context = contextlib.nullcontext if (is_accum_step or world_size == 1) else _ddp_no_sync
+        with sync_context(base_model):
+            scaler.scale(loss / args.grad_accum).backward()
+
+        if is_accum_step:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            ema_base.update(unwrap(base_model))
 
         log_loss  += loss.item()
         log_count += 1
 
-        if (step + 1) % args.log_every == 0:
+        if (step + 1) % args.log_every == 0 and is_main:
+            avg_loss = log_loss / log_count
             print(
                 f"[step {step+1:>7d}] "
                 f"lr={lr:.2e} | "
-                f"loss={log_loss / log_count:.4f}"
+                f"loss={avg_loss:.4f}"
             )
+            if args.wandb:
+                wandb.log({
+                    'loss': avg_loss,
+                    'lr': lr,
+                }, step=step + 1)
             log_loss  = 0.0
             log_count = 0
 
         # 训练中可视化
-        if args.viz_every > 0 and (step + 1) % args.viz_every == 0:
+        if args.viz_every > 0 and (step + 1) % args.viz_every == 0 and is_main:
             viz_dir = os.path.join(args.output_dir, "viz")
             os.makedirs(viz_dir, exist_ok=True)
-            ema_base.apply(base_model)
-            base_model.eval()
+            base_raw = unwrap(base_model)
+            ema_base.apply(base_raw)
+            base_raw.eval()
             grid = make_sample_grid(
-                base_model=base_model,
+                base_model=base_raw,
                 decoder=decoder,
                 latent_schedule=latent_schedule,
                 image_schedule=image_schedule,
@@ -657,12 +733,17 @@ def train_stage2(args, device: torch.device):
                 device=device,
                 dtype=dtype,
             )
-            ema_base.restore(base_model)
-            base_model.train()
+            ema_base.restore(base_raw)
+            base_raw.train()
             save_image(grid, os.path.join(viz_dir, f"step_{step+1:07d}.png"))
             print(f"  [viz] 已保存样本网格 → {viz_dir}/step_{step+1:07d}.png")
 
-        if (step + 1) % args.save_every == 0:
+            if args.wandb:
+                wandb.log({
+                    'samples': wandb.Image(grid.float().cpu() * 0.5 + 0.5),
+                }, step=step + 1)
+
+        if (step + 1) % args.save_every == 0 and is_main:
             save_checkpoint(
                 path=os.path.join(args.output_dir, f'ckpt_{step+1:07d}.pt'),
                 step=step + 1,
@@ -672,26 +753,31 @@ def train_stage2(args, device: torch.device):
                 args=args,
             )
 
-    save_checkpoint(
-        path=os.path.join(args.output_dir, 'ckpt_final.pt'),
-        step=args.total_steps,
-        models={'base_model': base_model},
-        optimizers={'optimizer': optimizer},
-        emas={'base_model': ema_base},
-        args=args,
-    )
-    print("阶段二训练完成。")
+    if is_main:
+        save_checkpoint(
+            path=os.path.join(args.output_dir, 'ckpt_final.pt'),
+            step=args.total_steps,
+            models={'base_model': base_model},
+            optimizers={'optimizer': optimizer},
+            emas={'base_model': ema_base},
+            args=args,
+        )
+        print("阶段二训练完成。")
 
 
 # ============================================================
 # 工具：无限循环 DataLoader
 # ============================================================
 
-def _infinite_loader(loader: DataLoader):
+def _infinite_loader(loader: DataLoader, sampler=None):
     """将有限的 DataLoader 包装成无限迭代器，训练时不需要管 epoch 边界。"""
+    epoch = 0
     while True:
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         for batch in loader:
             yield batch
+        epoch += 1
 
 
 # ============================================================
@@ -703,17 +789,25 @@ def main():
     if args.latent_size != args.resolution // 16:
         print("latent 不等于分辨率/16， 已经修改")
         args.latent_size = args.resolution // 16
-    torch.manual_seed(args.seed)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备：{device}")
+    rank, world_size, local_rank = setup_distributed()
+    is_main = (rank == 0)
+
+    torch.manual_seed(args.seed + rank)
+
+    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+    if is_main:
+        print(f"使用设备：{device}（world_size={world_size}）")
 
     if args.stage == 1:
-        train_stage1(args, device)
+        train_stage1(args, device, rank, world_size, local_rank)
     elif args.stage == 2:
-        train_stage2(args, device)
+        train_stage2(args, device, rank, world_size, local_rank)
     else:
         raise ValueError(f"--stage 只支持 1 或 2，收到 {args.stage}")
+
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
