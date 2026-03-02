@@ -10,6 +10,7 @@ Unified Latents (UL) - Model Architectures
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 import math
 
 
@@ -91,14 +92,23 @@ def run_layers(layers: nn.ModuleList, x: torch.Tensor,
     return x
 
 
-def sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
-    """t ∈ [0,1] → sinusoidal embedding [B, dim]，内部缩放 1000× 以获得足够的频率分辨率。"""
+def _run_block(block, tokens, t_emb, use_ckpt: bool):
+    """统一处理 ViT block 调用，支持 gradient checkpointing。"""
+    if use_ckpt:
+        return grad_checkpoint(block, tokens, t_emb, use_reentrant=False)
+    return block(tokens, t_emb)
+
+
+def make_sinusoidal_freqs(dim: int) -> torch.Tensor:
+    """预计算 sinusoidal embedding 的频率向量，用于 register_buffer 缓存。"""
     assert dim % 2 == 0
-    half  = dim // 2
-    freqs = torch.exp(
-        -math.log(10000) * torch.arange(half, device=t.device) / half
-    )
-    args  = (t * 1000)[:, None] * freqs[None, :]
+    half = dim // 2
+    return torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.float32) / half)
+
+
+def sinusoidal_embedding(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """t ∈ [0,1] → sinusoidal embedding [B, dim]，使用预计算的 freqs buffer。"""
+    args = (t * 1000)[:, None] * freqs[None, :]
     return torch.cat([args.sin(), args.cos()], dim=-1)
 
 def interpolate_pos_embed(pos_embed: torch.Tensor, h: int, w: int) -> torch.Tensor:
@@ -147,11 +157,9 @@ def interpolate_pos_embed(pos_embed: torch.Tensor, h: int, w: int) -> torch.Tens
 class Encoder(nn.Module):
     """
     确定性 ResNet 编码器。
-    下采样 16×：patch_embed(2×) × Downsample(2×) × Downsample(2×) × Downsample(2×)
-    四个阶段通道数 [128, 256, 512, 512]：
-      前三个阶段各 2 个 ResBlock + Downsample
-      最后一个阶段 3 个 ResBlock，不下采样
-    输出 z_clean [B, latent_channels, H/16, W/16]。
+    下采样 2^N×：patch_embed(2×) + (N-1) 个 Downsample(2×)，N = len(channel_mults)。
+    前 N-1 个阶段各 2 个 ResBlock + Downsample，最后一个阶段 3 个 ResBlock 不下采样。
+    输出 z_clean [B, latent_channels, H/(2^N), W/(2^N)]。
     """
     def __init__(self, in_channels: int = 3, latent_channels: int = 32,
                  channel_mults: tuple = (128, 256, 512, 512)):
@@ -282,6 +290,7 @@ class PriorModel(nn.Module):
             nn.Linear(embed_dim, time_dim), nn.SiLU(),
             nn.Linear(time_dim, time_dim),
         )
+        self.register_buffer('_sin_freqs', make_sinusoidal_freqs(embed_dim), persistent=False)
         self.patch_embed = PatchEmbed2D(latent_channels, embed_dim, patch_size)
         n_patches        = (latent_size // patch_size) ** 2
         self.pos_embed   = nn.Parameter(torch.zeros(1, n_patches, embed_dim))
@@ -293,15 +302,16 @@ class PriorModel(nn.Module):
         ])
         self.norm     = nn.LayerNorm(embed_dim)
         self.proj_out = nn.Linear(embed_dim, latent_channels * patch_size ** 2)
+        self.gradient_checkpointing = False
 
     def forward(self, z_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         B, C, H, W = z_t.shape
-        t_emb = self.time_mlp(sinusoidal_embedding(t, self.time_mlp[0].in_features))
+        t_emb = self.time_mlp(sinusoidal_embedding(t, self._sin_freqs))
 
         tokens, (h, w) = self.patch_embed(z_t)
         tokens = tokens + interpolate_pos_embed(self.pos_embed, h, w)
         for block in self.blocks:
-            tokens = block(tokens, t_emb)
+            tokens = _run_block(block, tokens, t_emb, self.gradient_checkpointing and self.training)
         tokens = self.norm(tokens)
 
         p      = self.patch_size
@@ -347,20 +357,18 @@ class DiffusionDecoder(nn.Module):
             nn.Linear(embed_dim, time_dim), nn.SiLU(),
             nn.Linear(time_dim, time_dim),
         )
+        self.register_buffer('_sin_freqs', make_sinusoidal_freqs(embed_dim), persistent=False)
 
         self.conv_in = nn.Conv2d(in_channels, conv_channels[0], 3, padding=1)
 
         # ----- 下采样路径 -----
         # 每个阶段：ResBlock × 2，然后 Downsample
-        # 全部放入一个 ModuleList，用 (layer_idx, stage_idx) 分组信息保存在 down_stage_ends
         self.down_layers = nn.ModuleList()
-        self.down_stage_ends: list[int] = []   # 每个阶段最后一层的 index（Downsample）
         in_ch = conv_channels[0]
         for out_ch in conv_channels:
             self.down_layers.append(ResBlock(in_ch, out_ch, time_emb_dim=time_dim))
             self.down_layers.append(ResBlock(out_ch, out_ch, time_emb_dim=time_dim))
             self.down_layers.append(Downsample(out_ch))
-            self.down_stage_ends.append(len(self.down_layers) - 1)
             in_ch = out_ch
 
         # ----- ViT 中间层 -----
@@ -379,6 +387,7 @@ class DiffusionDecoder(nn.Module):
         self.vit_norm = nn.LayerNorm(embed_dim)
         self.dropout  = nn.Dropout(dropout)
         self.proj_out = nn.Linear(embed_dim, conv_channels[-1] * patch_size ** 2)
+        self.gradient_checkpointing = False
 
         # ----- 上采样路径 -----
         # 每个阶段：Upsample，然后 ResBlock × 2（接收 skip，通道翻倍）
@@ -396,7 +405,7 @@ class DiffusionDecoder(nn.Module):
     def forward(self, x_t: torch.Tensor, z_0: torch.Tensor,
                 t: torch.Tensor) -> torch.Tensor:
         B = x_t.shape[0]
-        t_emb = self.time_mlp(sinusoidal_embedding(t, self.time_mlp[0].in_features))
+        t_emb = self.time_mlp(sinusoidal_embedding(t, self._sin_freqs))
 
         # ----- 下采样，记录 skip -----
         skips: list[torch.Tensor] = []
@@ -420,7 +429,7 @@ class DiffusionDecoder(nn.Module):
 
         tokens = self.dropout(torch.cat([z_tokens, img_tokens], dim=1))
         for block in self.vit_blocks:
-            tokens = block(tokens, t_emb)
+            tokens = _run_block(block, tokens, t_emb, self.gradient_checkpointing and self.training)
         tokens = self.vit_norm(tokens)
 
         # 丢弃 z prefix，还原图像特征图
@@ -471,6 +480,7 @@ class BaseModel(nn.Module):
         self.time_mlp = nn.Sequential(
             nn.Linear(dim2, time_dim), nn.SiLU(), nn.Linear(time_dim, time_dim)
         )
+        self.register_buffer('_sin_freqs', make_sinusoidal_freqs(dim2), persistent=False)
 
         # Stage 1
         self.patch_embed1 = PatchEmbed2D(latent_channels, dim1, patch_size)
@@ -496,20 +506,21 @@ class BaseModel(nn.Module):
         self.norm2    = nn.LayerNorm(dim2)
         self.dropout2 = nn.Dropout(dropout)
         self.proj_out = nn.Linear(dim2, latent_channels * patch_size ** 2)
+        self.gradient_checkpointing = False
 
     def forward(self, z_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         B, C, H, W = z_t.shape
-        t_emb = self.time_mlp(sinusoidal_embedding(t, self.time_mlp[0].in_features))
+        t_emb = self.time_mlp(sinusoidal_embedding(t, self._sin_freqs))
 
         tokens, (h, w) = self.patch_embed1(z_t)
         tokens = self.dropout1(tokens + interpolate_pos_embed(self.pos_embed1, h, w))
         for block in self.blocks1:
-            tokens = block(tokens, t_emb)
+            tokens = _run_block(block, tokens, t_emb, self.gradient_checkpointing and self.training)
         tokens = self.norm1(tokens)
 
         tokens = self.dropout2(self.bridge(tokens) + interpolate_pos_embed(self.pos_embed2, h, w))
         for block in self.blocks2:
-            tokens = block(tokens, t_emb)
+            tokens = _run_block(block, tokens, t_emb, self.gradient_checkpointing and self.training)
         tokens = self.norm2(tokens)
 
         p      = self.patch_size

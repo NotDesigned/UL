@@ -1,5 +1,4 @@
 import torch
-from typing import Tuple
 import torch.nn.functional as F
 
 class NoiseSchedule:
@@ -16,11 +15,12 @@ class NoiseSchedule:
     def __init__(self, lambda_0: float, lambda_1: float):
         self.lambda_0 = lambda_0
         self.lambda_1 = lambda_1
+        self.dlam_dt = lambda_0 - lambda_1  # -dλ/dt，正常数，预计算避免重复运算
 
     def log_snr(self, t: torch.Tensor) -> torch.Tensor:
         return self.lambda_0 + (self.lambda_1 - self.lambda_0) * t
     
-    def alpha_sigma(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def alpha_sigma(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         lam = self.log_snr(t)
         alpha = torch.sqrt(torch.sigmoid(lam))
         sigma = torch.sqrt(torch.sigmoid(-lam))
@@ -106,8 +106,7 @@ def diffusion_loss(
     # x-prediction 的连续时间 ELBO（Kingma VDM 2021, Eq.12）：
     #   L = ½ E_t [ |dλ/dt| · exp(λ) · ||x - x̂||² ]
     # linear schedule 下 -dλ/dt = λ_min - λ_max（正常数）
-    dlam_dt = schedule.lambda_0 - schedule.lambda_1   # -dλ/dt，正数常数
-    snr_weight = dlam_dt * torch.exp(lam) / 2             # [B]
+    snr_weight = schedule.dlam_dt * torch.exp(lam) / 2     # [B]
 
     w = weight_fn(lam)                          # [B]，unweighted=1 或 sigmoid 值
 

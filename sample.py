@@ -20,8 +20,7 @@ import argparse
 from pathlib import Path
 
 import torch
-import torchvision
-from torchvision.utils import save_image
+from torchvision.utils import save_image, make_grid
 
 from models import Encoder, DiffusionDecoder, BaseModel, PriorModel
 from utils import NoiseSchedule, get_latent_schedule, get_image_schedule
@@ -78,24 +77,20 @@ def _run_diffusion_loop(
     n_steps:  int,
     eta:      float,
     device:   torch.device,
-    dtype:    torch.dtype,
 ) -> torch.Tensor:
     """
     通用扩散采样循环。
     model_fn 封装了模型调用（含条件），外部传入，内部不感知模型类型。
     """
-    x         = torch.randn(*shape, device=device, dtype=dtype)
+    B         = shape[0]
+    x         = torch.randn(*shape, device=device, dtype=torch.bfloat16)
     timesteps = torch.linspace(1.0, 0.0, n_steps + 1).tolist()
 
-    use_autocast = dtype in (torch.float16, torch.bfloat16)
-    ac_device    = device.type if device.type in ['cuda', 'cpu', 'xpu'] else 'cuda'
-    
     for i in range(n_steps):
         t_now  = timesteps[i]
         t_next = timesteps[i + 1]
-        B      = shape[0]
-        t_b    = torch.full((B,), t_now, device=device, dtype=dtype)
-        with torch.autocast(device_type=ac_device, dtype=dtype, enabled=use_autocast):
+        t_b    = torch.full((B,), t_now, device=device, dtype=torch.bfloat16)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             x_hat  = model_fn(x, t_b)
         x      = denoise_step(x_hat, x, t_now, t_next, schedule, eta)
 
@@ -116,7 +111,6 @@ def sample_latents(
     n_steps:         int   = 100,
     sampler:         str   = 'ddim',
     device:          torch.device = None,
-    dtype:           torch.dtype  = torch.float32,
 ) -> torch.Tensor:
     """
     BaseModel 从纯噪声采样 z_0。
@@ -127,16 +121,14 @@ def sample_latents(
 
     eta = 0.0 if sampler == 'ddim' else 1.0
 
-    z_0 = _run_diffusion_loop(
-        model_fn  = lambda z, t: base_model(z, t),
+    return _run_diffusion_loop(
+        model_fn  = base_model,
         shape     = (n_samples, latent_channels, latent_size, latent_size),
         schedule  = latent_schedule,
         n_steps   = n_steps,
         eta       = eta,
         device    = device,
-        dtype     = dtype,
     )
-    return z_0
 
 
 @torch.no_grad()
@@ -148,7 +140,6 @@ def sample_images(
     sampler:        str  = 'ddim',
     resolution:     int  = 512,
     device:         torch.device = None,
-    dtype:          torch.dtype  = torch.float32,
 ) -> torch.Tensor:
     """
     DiffusionDecoder 以 z_0 为条件采样图像。
@@ -162,9 +153,7 @@ def sample_images(
 
     B   = z_0.shape[0]
     eta = 0.0 if sampler == 'ddim' else 1.0
-
-    # z_0 转到正确的 device/dtype
-    z_0 = z_0.to(device=device, dtype=dtype)
+    z_0 = z_0.to(device=device, dtype=torch.bfloat16)
 
     images = _run_diffusion_loop(
         model_fn  = lambda x, t: decoder(x, z_0, t),
@@ -173,7 +162,6 @@ def sample_images(
         n_steps   = n_steps,
         eta       = eta,
         device    = device,
-        dtype     = dtype,
     )
     return images.clamp(-1, 1)
 
@@ -188,7 +176,6 @@ def reconstruct(
     n_steps:         int  = 50,
     sampler:         str  = 'ddim',
     device:          torch.device = None,
-    dtype:           torch.dtype  = torch.float32,
 ) -> torch.Tensor:
     """
     编码 → z_0 → 解码，用于重建质量评测（PSNR / rFID）。
@@ -197,21 +184,19 @@ def reconstruct(
     if device is None:
         device = next(encoder.parameters()).device
 
-    images  = images.to(device=device, dtype=dtype)
-    use_autocast = dtype in (torch.float16, torch.bfloat16)
-    ac_device    = device.type if device.type in ['cuda', 'cpu', 'xpu'] else 'cuda'
-    
-    with torch.autocast(device_type=ac_device, dtype=dtype, enabled=use_autocast):
+    images = images.to(device=device, dtype=torch.bfloat16)
+
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
         z_clean = encoder(images)
-    
-    t_zero = torch.zeros(images.shape[0], device=device, dtype=dtype)
+
+    t_zero = torch.zeros(images.shape[0], device=device, dtype=torch.bfloat16)
     z_0, _ = latent_schedule.forward_noise(z_clean, t_zero)
 
     return sample_images(
         decoder, z_0, image_schedule,
         n_steps=n_steps, sampler=sampler,
         resolution=images.shape[-1],
-        device=device, dtype=dtype,
+        device=device,
     )
 
 
@@ -232,7 +217,6 @@ def make_sample_grid(
     n_steps:         int  = 50,     # 可视化时用更少步数以加快速度
     sampler:         str  = 'ddim',
     device:          torch.device = None,
-    dtype:           torch.dtype  = torch.float32,
 ) -> torch.Tensor:
     """
     一步生成 n_samples 张图像并拼成网格，供训练日志使用。
@@ -251,20 +235,20 @@ def make_sample_grid(
         latent_channels=latent_channels,
         latent_size=latent_size,
         n_steps=n_steps, sampler=sampler,
-        device=device, dtype=dtype,
+        device=device,
     )
     imgs = sample_images(
         decoder, z_0, image_schedule,
         n_steps=n_steps, sampler=sampler,
         resolution=resolution,
-        device=device, dtype=dtype,
+        device=device,
     )
 
     # 恢复训练模式
     base_model.train(was_training_base)
     decoder.train(was_training_decoder)
 
-    grid = torchvision.utils.make_grid(
+    grid = make_grid(
         imgs.float().cpu() * 0.5 + 0.5,    # [-1,1] → [0,1]
         nrow=int(n_samples ** 0.5),
         padding=2,
@@ -276,50 +260,35 @@ def make_sample_grid(
 # IO 工具（仅命令行入口使用）
 # ============================================================
 
-def load_model_weights(model, ckpt_path: str, key: str,
-                       device: torch.device):
-    """优先加载 EMA 权重，其次普通权重。"""
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    if 'emas' in ckpt and key in ckpt['emas']:
-        model.load_state_dict(ckpt['emas'][key])
-        print(f"  [load] {key} <- EMA  @ {ckpt_path}")
-    elif 'models' in ckpt and key in ckpt['models']:
-        model.load_state_dict(ckpt['models'][key])
-        print(f"  [load] {key} <- model @ {ckpt_path}")
-    else:
-        raise KeyError(f"检查点 {ckpt_path} 中找不到 key='{key}'")
-
-
 def build_models_from_ckpt(
     stage1_ckpt: str,
     stage2_ckpt: str,
     device: torch.device,
-    override_resolution: int = None,
 ):
     """
     从 checkpoint 保存的 args 中恢复模型结构参数并构建完整模型。
-    避免手动指定与训练时不一致的超参导致 state_dict 加载失败。
+    所有超参从 checkpoint 读取，避免手动指定导致不一致。
 
     Returns:
-        (encoder, decoder, base_model, train_args_dict)
+        (encoder, decoder, base_model, info_dict)
     """
     ckpt1 = torch.load(stage1_ckpt, map_location=device, weights_only=True)
     ckpt2 = torch.load(stage2_ckpt, map_location=device, weights_only=True)
     ta = ckpt1.get('args', {})
 
-    latent_channels = ta.get('latent_channels', 32)
-    resolution      = override_resolution or ta.get('resolution', 512)
-    latent_size     = resolution // 16
-    enc_ch          = tuple(map(int, ta.get('enc_channels', '128,256,512,512').split(',')))
-    dec_ch          = tuple(map(int, ta.get('dec_channels', '128,256,512').split(',')))
-    embed_dim       = ta.get('embed_dim', 1024)
-    vit_blocks      = ta.get('vit_blocks', 8)
-    vit_heads       = ta.get('vit_heads', 16)
+    latent_channels = ta['latent_channels']
+    resolution      = ta['resolution']
+    enc_ch          = tuple(ta['enc_channels'])
+    dec_ch          = tuple(ta['dec_channels'])
+    embed_dim       = ta['embed_dim']
+    vit_blocks      = ta['vit_blocks']
+    vit_heads       = ta['vit_heads']
+    latent_size     = resolution // (2 ** len(enc_ch))
 
     ta2 = ckpt2.get('args', {})
-    base_dims   = tuple(map(int, ta2.get('base_dims', '512,1024').split(',')))
-    base_blocks = tuple(map(int, ta2.get('base_blocks', '6,16').split(',')))
-    base_heads  = tuple(map(int, ta2.get('base_heads', '8,16').split(',')))
+    base_dims   = tuple(ta2['base_dims'])
+    base_blocks = tuple(ta2['base_blocks'])
+    base_heads  = tuple(ta2['base_heads'])
 
     encoder = Encoder(
         in_channels=3, latent_channels=latent_channels, channel_mults=enc_ch,
@@ -335,7 +304,7 @@ def build_models_from_ckpt(
         stage_dims=base_dims, stage_blocks=base_blocks, n_heads=base_heads,
     ).to(device)
 
-    # 加载权重
+    # 加载权重（优先 EMA）
     for key, model, ckpt in [
         ('encoder', encoder, ckpt1), ('decoder', decoder, ckpt1),
         ('base_model', base_model, ckpt2),
@@ -369,10 +338,6 @@ def get_args():
                    choices=['ddpm', 'ddim'])
     p.add_argument('--latent_steps',    type=int, default=100)
     p.add_argument('--image_steps',     type=int, default=100)
-    p.add_argument('--latent_channels', type=int, default=32)
-    p.add_argument('--latent_size',     type=int, default=32)
-    p.add_argument('--resolution',      type=int, default=512)
-    p.add_argument('--mixed_precision', action='store_true')
     p.add_argument('--seed',            type=int, default=0)
     return p.parse_args()
 
@@ -380,8 +345,7 @@ def get_args():
 def main():
     args   = get_args()
     torch.manual_seed(args.seed)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dtype  = torch.bfloat16 if args.mixed_precision else torch.float32
+    device = torch.device('cuda')
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     latent_schedule = get_latent_schedule()
@@ -390,7 +354,6 @@ def main():
     print("加载权重...")
     encoder, decoder, base, info = build_models_from_ckpt(
         args.stage1_ckpt, args.stage2_ckpt, device,
-        override_resolution=args.resolution,
     )
     encoder.eval(); decoder.eval(); base.eval()
 
@@ -410,12 +373,12 @@ def main():
                                latent_size=latent_size,
                                n_steps=args.latent_steps,
                                sampler=args.sampler,
-                               device=device, dtype=dtype)
+                               device=device)
         imgs = sample_images(decoder, z_0, image_schedule,
                               n_steps=args.image_steps,
                               sampler=args.sampler,
                               resolution=resolution,
-                              device=device, dtype=dtype)
+                              device=device)
         all_images.append(imgs.float().cpu())
         remaining -= bs
 
@@ -425,7 +388,7 @@ def main():
         save_image(img * 0.5 + 0.5,
                    os.path.join(args.output_dir, f'sample_{i:04d}.png'))
 
-    grid = torchvision.utils.make_grid(
+    grid = make_grid(
         all_images * 0.5 + 0.5,
         nrow=int(args.n_samples ** 0.5), padding=2,
     )

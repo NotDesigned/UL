@@ -3,3 +3,4 @@ runs/*
 *.pyc
 wandb
 *.un~
+.vscode/

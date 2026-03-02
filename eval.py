@@ -19,20 +19,17 @@ Unified Latents (UL) - Evaluation
 
 import os
 import argparse
-import math
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 
 from dataset import get_dataloader
-from models import Encoder, DiffusionDecoder, BaseModel
 from utils import get_latent_schedule, get_image_schedule
 from sample import (
     sample_latents, sample_images, reconstruct,
-    load_model_weights, build_models_from_ckpt,
+    build_models_from_ckpt,
 )
 
 
@@ -101,14 +98,12 @@ def save_images_to_dir(images: torch.Tensor, out_dir: str, start_idx: int = 0):
 # ============================================================
 
 def evaluate(args, device: torch.device):
-    dtype           = torch.bfloat16 if args.mixed_precision else torch.float32
     latent_schedule = get_latent_schedule()
     image_schedule  = get_image_schedule()
 
     # ----- 加载模型（从 checkpoint 恢复完整结构参数）-----
     encoder, decoder, base, info = build_models_from_ckpt(
         args.stage1_ckpt, args.stage2_ckpt, device,
-        override_resolution=args.resolution,
     )
     encoder.eval(); decoder.eval(); base.eval()
     latent_channels = info['latent_channels']
@@ -123,9 +118,9 @@ def evaluate(args, device: torch.device):
         os.makedirs(d, exist_ok=True)
 
     # ----- 数据加载器（用于 rFID 和 PSNR）-----
-    val_loader = get_dataloader(
+    val_loader, _ = get_dataloader(
         root=args.data_root, split='val',
-        resolution=args.resolution,
+        resolution=resolution,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         flat=args.flat_data,
@@ -152,7 +147,7 @@ def evaluate(args, device: torch.device):
             latent_schedule, image_schedule,
             n_steps=args.decode_steps,
             sampler=args.sampler,
-            device=device, dtype=dtype,
+            device=device,
         )
 
         # PSNR
@@ -187,14 +182,14 @@ def evaluate(args, device: torch.device):
             latent_size=latent_size,
             n_steps=args.latent_steps,
             sampler=args.sampler,
-            device=device, dtype=dtype,
+            device=device,
         )
         gen_images = sample_images(
             decoder, z_0, image_schedule,
             n_steps=args.decode_steps,
             sampler=args.sampler,
             resolution=resolution,
-            device=device, dtype=dtype,
+            device=device,
         )
         save_images_to_dir(gen_images, gen_dir, start_idx=n_gen_saved)
         n_gen_saved += bs
@@ -257,11 +252,6 @@ def get_args():
     p.add_argument('--sampler',         type=str, default='ddim',
                    choices=['ddpm', 'ddim'])
 
-    p.add_argument('--latent_channels', type=int, default=32)
-    p.add_argument('--latent_size',     type=int, default=32)
-    p.add_argument('--resolution',      type=int, default=512)
-
-    p.add_argument('--mixed_precision', action='store_true')
     p.add_argument('--flat_data',       action='store_true')
     p.add_argument('--seed',            type=int, default=0)
     return p.parse_args()
@@ -270,7 +260,7 @@ def get_args():
 def main():
     args   = get_args()
     torch.manual_seed(args.seed)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda')
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     print(f"设备：{device} | 输出目录：{args.output_dir}")
     evaluate(args, device)
