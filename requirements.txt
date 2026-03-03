@@ -4,3 +4,4 @@ numpy
 Pillow
 pytorch-fid
 wandb
+datasets

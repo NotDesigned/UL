@@ -119,11 +119,10 @@ def evaluate(args, device: torch.device):
 
     # ----- 数据加载器（用于 rFID 和 PSNR）-----
     val_loader, _ = get_dataloader(
-        root=args.data_root, split='val',
+        root=args.data_root, split='validation',
         resolution=resolution,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        flat=args.flat_data,
     )
 
     # ==========================================
@@ -252,7 +251,6 @@ def get_args():
     p.add_argument('--sampler',         type=str, default='ddim',
                    choices=['ddpm', 'ddim'])
 
-    p.add_argument('--flat_data',       action='store_true')
     p.add_argument('--seed',            type=int, default=0)
     return p.parse_args()
 

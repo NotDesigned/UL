@@ -1,18 +1,16 @@
 """
 Unified Latents (UL) - Dataset
-支持 ImageNet 和通用图像文件夹格式。
+使用 HuggingFace Datasets Parquet 格式加载图像数据集。
 """
-
-import os
-from pathlib import Path
-from PIL import Image
 
 import random
 
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, datasets
+from torchvision import transforms
+from datasets import load_dataset as hf_load_dataset
 
 
 # ============================================================
@@ -48,72 +46,42 @@ def get_transform(resolution: int = 512, split: str = 'train') -> transforms.Com
 
 
 # ============================================================
-# ImageNet Dataset
+# Dataset
 # ============================================================
 
-class ImageNetDataset(Dataset):
+class HFImageDataset(Dataset):
     """
-    ImageNet 数据集包装。
+    通用 HuggingFace Datasets Parquet 格式图像数据集包装。
 
-    期望的目录结构（torchvision 标准格式）：
+    适用于任何以 HuggingFace datasets 标准格式存储在本地的图像数据集，
+    包括 mini-imagenet、imagenet-1k 等，只需提供本地根目录。
+
+    期望的目录结构：
         root/
-          train/
-            n01440764/   ← synset 文件夹
-              xxx.JPEG
-              ...
-          val/
-            n01440764/
-              ...
+          data/
+            train-*.parquet
+            validation-*.parquet
+            test-*.parquet
+          README.md              ← 包含 dataset_info 的 YAML 元数据
 
-    如果只有图像文件夹（无类别子目录），用 FlatImageDataset。
+    数据集字段要求：
+        image  —— PIL.Image（HuggingFace Image feature 自动解码）
+        label  —— 类别整数（可选，训练时不使用）
     """
-    def __init__(self, root: str, split: str = 'train',
-                 resolution: int = 512):
+
+    def __init__(self, root: str, split: str = 'train', resolution: int = 512):
         super().__init__()
-        split_dir = os.path.join(root, split)
-        if not os.path.isdir(split_dir):
-            raise FileNotFoundError(
-                f"找不到 {split_dir}，请确认 ImageNet 目录结构正确。"
-            )
-        self.dataset = datasets.ImageFolder(
-            root=split_dir,
-            transform=get_transform(resolution, split),
-        )
+        self.dataset   = hf_load_dataset(root, split=split, trust_remote_code=False)
+        self.transform = get_transform(resolution, split)
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        image, _ = self.dataset[idx]
-        return image
-
-
-class FlatImageDataset(Dataset):
-    """
-    通用平铺图像文件夹，目录下直接放图像文件，无需类别子目录。
-    适合小规模实验或自定义数据集。
-
-    支持格式：jpg / jpeg / png / webp
-    """
-    EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
-
-    def __init__(self, root: str, split: str = 'train',
-                 resolution: int = 512):
-        super().__init__()
-        self.transform = get_transform(resolution, split)
-        self.paths = sorted([
-            p for p in Path(root).rglob('*')
-            if p.suffix.lower() in self.EXTENSIONS
-        ])
-        if len(self.paths) == 0:
-            raise FileNotFoundError(f"{root} 下找不到任何图像文件。")
-
-    def __len__(self) -> int:
-        return len(self.paths)
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        img = Image.open(self.paths[idx]).convert('RGB')
-        return self.transform(img)
+        img = self.dataset[idx]['image']   # HuggingFace Image feature → PIL.Image
+        if not isinstance(img, Image.Image):
+            img = Image.fromarray(img)
+        return self.transform(img.convert('RGB'))
 
 
 # ============================================================
@@ -126,7 +94,6 @@ def get_dataloader(
     resolution: int = 512,
     batch_size: int = 16,
     num_workers: int = 8,
-    flat: bool = False,
     distributed: bool = False,
     rank: int = 0,
     world_size: int = 1,
@@ -135,12 +102,11 @@ def get_dataloader(
     创建 DataLoader。
 
     Args:
-        root:        数据集根目录
-        split:       'train' 或 'val'
+        root:        数据集根目录（HuggingFace Parquet 格式）
+        split:       'train' / 'validation' / 'test'
         resolution:  图像分辨率
         batch_size:  批大小
         num_workers: 数据加载线程数
-        flat:        True 表示使用 FlatImageDataset（无类别子目录）
         distributed: 是否使用 DistributedSampler（DDP 模式）
         rank:        当前进程的 rank
         world_size:  总进程数
@@ -155,19 +121,16 @@ def get_dataloader(
         np.random.seed(seed + worker_id)
         random.seed(seed + worker_id)
 
-    dataset_cls = FlatImageDataset if flat else ImageNetDataset
-    dataset     = dataset_cls(root, split, resolution)
+    dataset = HFImageDataset(root, split, resolution)
 
     sampler = None
     if distributed:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
 
-    shuffle = (split == 'train') if sampler is None else False
-
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=(split == 'train') if sampler is None else False,
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,

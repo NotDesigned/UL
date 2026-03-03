@@ -5,22 +5,23 @@ Unified Latents (UL) - Training
 
 用法：
   # 阶段一（单卡，small preset）
-  python train.py --preset small --data_root ~/datasets/afhq --flat_data
+  python train.py --preset small --data_root ~/datasets/xxxx
 
   # 阶段一（多卡）
-  torchrun --nproc_per_node=4 train.py --preset small --data_root ~/datasets/afhq --flat_data
+  torchrun --nproc_per_node=4 train.py --preset small --data_root ~/datasets/xxxx
 
   # 阶段二
-  python train.py --stage 2 --preset small --data_root ~/datasets/afhq --flat_data \
+  python train.py --stage 2 --preset small --data_root ~/datasets/xxxx \
                   --stage1_ckpt ./runs/stage1/run_0001/ckpt_final.pt
 
   # 恢复训练
-  python train.py --preset small --data_root ~/datasets/afhq --flat_data \
+  python train.py --preset small --data_root ~/datasets/xxxx \
                   --resume ./runs/stage1/run_0001/ckpt_0010000.pt
 """
 
 import os
 import math
+import time
 import argparse
 import contextlib
 from pathlib import Path
@@ -120,8 +121,6 @@ def get_args():
     p.add_argument('--resolution',   type=int,   default=512)
     p.add_argument('--batch_size',   type=int,   default=16)
     p.add_argument('--num_workers',  type=int,   default=8)
-    p.add_argument('--flat_data',    action='store_true',
-                   help='使用 FlatImageDataset（无类别子目录）')
 
     # 模型
     p.add_argument('--latent_channels', type=int, default=32)
@@ -150,7 +149,7 @@ def get_args():
     p.add_argument('--ema_decay',    type=float, default=0.9999)
     p.add_argument('--grad_accum',   type=int,   default=1,
                    help='梯度累积步数（有效 batch = batch_size × grad_accum × world_size）')
-    p.add_argument('--effective_batch', type=int, default=None,
+    p.add_argument('--effective_batch_size', type=int, default=None,
                    help='设置有效 batch size，自动计算 grad_accum（优先于 --grad_accum）')
 
     # UL 超参（控制 latent bitrate）
@@ -218,7 +217,10 @@ def setup_distributed():
 def unwrap(model):
     """获取 DDP / torch.compile 包装下的原始模型。"""
     while hasattr(model, 'module') or hasattr(model, '_orig_mod'):
-        model = getattr(model, 'module', None) or getattr(model, '_orig_mod')
+        if hasattr(model, 'module'):
+            model = model.module
+        else:
+            model = model._orig_mod
     return model
 
 
@@ -409,7 +411,6 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
         resolution=args.resolution,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        flat=args.flat_data,
         distributed=(world_size > 1),
         rank=rank,
         world_size=world_size,
@@ -443,6 +444,7 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
     log_count  = 0
 
     optimizer.zero_grad()
+    t_train_start = time.time()
 
     for step in range(start_step, args.total_steps):
 
@@ -522,8 +524,12 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
 
         if (step + 1) % args.log_every == 0 and is_main:
             avg = {k: v / log_count for k, v in log_losses.items()}
+            steps_done = step + 1 - start_step
+            elapsed = time.time() - t_train_start
+            eta = elapsed / steps_done * (args.total_steps - step - 1)
             print(
-                f"[step {step+1:>7d}] "
+                f"[step {step+1:>7d}/{args.total_steps}] "
+                f"eta={_fmt_eta(eta)} | "
                 f"lr={lr:.2e} | "
                 f"total={avg['total']:.4f} | "
                 f"prior={avg['prior']:.4f} | "
@@ -689,7 +695,6 @@ def train_stage2(args, device: torch.device, rank: int, world_size: int, local_r
         resolution=args.resolution,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        flat=args.flat_data,
         distributed=(world_size > 1),
         rank=rank,
         world_size=world_size,
@@ -718,6 +723,7 @@ def train_stage2(args, device: torch.device, rank: int, world_size: int, local_r
     log_count = 0
 
     optimizer.zero_grad()
+    t_train_start = time.time()
 
     for step in range(start_step, args.total_steps):
 
@@ -762,8 +768,12 @@ def train_stage2(args, device: torch.device, rank: int, world_size: int, local_r
 
         if (step + 1) % args.log_every == 0 and is_main:
             avg_loss = log_loss / log_count
+            steps_done = step + 1 - start_step
+            elapsed = time.time() - t_train_start
+            eta = elapsed / steps_done * (args.total_steps - step - 1)
             print(
-                f"[step {step+1:>7d}] "
+                f"[step {step+1:>7d}/{args.total_steps}] "
+                f"eta={_fmt_eta(eta)} | "
                 f"lr={lr:.2e} | "
                 f"loss={avg_loss:.4f}"
             )
@@ -887,6 +897,19 @@ def _count_params(model: nn.Module) -> str:
     return f'{n / 1e3:.1f}K'
 
 
+def _fmt_eta(seconds: float) -> str:
+    """将秒数格式化为 1d2h3m 或 2h3m 或 5m30s 的可读字符串。"""
+    s = int(seconds)
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if d > 0:
+        return f'{d}d{h}h{m}m'
+    if h > 0:
+        return f'{h}h{m}m'
+    return f'{m}m{s}s'
+
+
 def _print_run_info(args, device: torch.device, world_size: int):
     """训练开始前打印运行配置摘要。"""
     eff_batch = args.batch_size * args.grad_accum * world_size
@@ -940,14 +963,14 @@ def main():
     rank, world_size, local_rank = setup_distributed()
     is_main = (rank == 0)
 
-    # --effective_batch: 自动计算 grad_accum
-    if args.effective_batch is not None:
+    # --effective_batch_size: 自动计算 grad_accum
+    if args.effective_batch_size is not None:
         per_gpu = args.batch_size * world_size
-        if args.effective_batch % per_gpu != 0:
+        if args.effective_batch_size % per_gpu != 0:
             raise ValueError(
-                f'--effective_batch ({args.effective_batch}) 必须是 '
+                f'--effective_batch_size ({args.effective_batch_size}) 必须是 '
                 f'batch_size × world_size ({args.batch_size} × {world_size} = {per_gpu}) 的整数倍')
-        args.grad_accum = args.effective_batch // per_gpu
+        args.grad_accum = args.effective_batch_size // per_gpu
 
     args.output_dir = _resolve_output_dir(args, is_main)
 
