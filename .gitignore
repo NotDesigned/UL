@@ -5,3 +5,4 @@ wandb
 *.un~
 .vscode/
 .claude/
+eval_output/

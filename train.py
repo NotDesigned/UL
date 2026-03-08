@@ -736,7 +736,7 @@ def train_stage2(args, device: torch.device, rank: int, world_size: int, local_r
 
         with autocast(device_type='cuda', dtype=torch.bfloat16):
 
-            with torch.inference_mode():
+            with torch.no_grad():
                 z_clean = encoder(x)
                 z_0 = add_latent_noise(z_clean, latent_schedule)
 
@@ -940,6 +940,7 @@ def _print_run_info(args, device: torch.device, world_size: int):
     print('-' * 60)
     print(f'  Batch:   {args.batch_size} × {args.grad_accum} accum × {world_size} GPU = {eff_batch} effective')
     print(f'  LR:      {args.lr:.1e} | Steps: {args.total_steps:,} | Loss factor: {args.loss_factor}')
+    print(f'  Grad clip: {args.grad_clip} | EMA decay: {args.ema_decay} | Grad ckpt: {args.grad_ckpt}')
     print('=' * 60)
 
 

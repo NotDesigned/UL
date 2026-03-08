@@ -283,7 +283,7 @@ def build_models_from_ckpt(
     embed_dim       = ta['embed_dim']
     vit_blocks      = ta['vit_blocks']
     vit_heads       = ta['vit_heads']
-    latent_size     = resolution // (2 ** len(enc_ch))
+    latent_size     = ta['latent_size']
 
     ta2 = ckpt2.get('args', {})
     base_dims   = tuple(ta2['base_dims'])
