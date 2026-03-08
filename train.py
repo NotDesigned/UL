@@ -2,21 +2,6 @@
 Unified Latents (UL) - Training
 阶段一：编码器 + 先验 + 解码器联合训练
 阶段二：冻结编码器/解码器，训练 BaseModel
-
-用法：
-  # 阶段一（单卡，small preset）
-  python train.py --preset small --data_root ~/datasets/xxxx
-
-  # 阶段一（多卡）
-  torchrun --nproc_per_node=4 train.py --preset small --data_root ~/datasets/xxxx
-
-  # 阶段二
-  python train.py --stage 2 --preset small --data_root ~/datasets/xxxx \
-                  --stage1_ckpt ./runs/stage1/run_0001/ckpt_final.pt
-
-  # 恢复训练
-  python train.py --preset small --data_root ~/datasets/xxxx \
-                  --resume ./runs/stage1/run_0001/ckpt_0010000.pt
 """
 
 import os
