@@ -518,14 +518,15 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
                 f"lr={lr:.2e} | "
                 f"total={avg['total']:.4f} | "
                 f"prior={avg['prior']:.4f} | "
-                f"dec={avg['decoder']:.4f} | "
+                f"dec={avg['decoder']/args.loss_factor:.4f} (weighted: {avg['decoder']:.4f}) | "
                 f"kl={avg['kl']:.10f}"
             )
             if args.wandb:
                 wandb.log({
                     'loss/total': avg['total'],
                     'loss/prior': avg['prior'],
-                    'loss/decoder': avg['decoder'],
+                    'loss/decoder_weighted': avg['decoder'],
+                    'loss/decoder': avg['decoder'] / args.loss_factor,
                     'loss/kl': avg['kl'],
                     'lr': lr,
                 }, step=step + 1)
