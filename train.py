@@ -24,7 +24,7 @@ from sample import make_sample_grid, reconstruct
 from torchvision.utils import save_image, make_grid
 
 from utils import (
-    get_latent_schedule, get_image_schedule,
+    NoiseSchedule, get_latent_schedule, get_image_schedule,
     add_latent_noise, sample_timesteps,
     diffusion_loss, kl_standard_normal,
     loss_weight_unweighted, loss_weight_sigmoid,
@@ -140,7 +140,7 @@ def get_args():
     # UL 超参（控制 latent bitrate）
     p.add_argument('--loss_factor',   type=float, default=1.5,
                    help='解码器损失放大系数，对抗 posterior collapse，论文用 1.3-1.7')
-    p.add_argument('--sigmoid_shift', type=float, default=0.0,
+    p.add_argument('--sigmoid_shift', type=float, default=4.0,
                    help='解码器 sigmoid 权重的偏移量 b')
 
     # 可视化
@@ -425,7 +425,7 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
 
     # ----- 训练循环 -----
     encoder.train(); prior.train(); decoder.train()
-    log_losses = {'prior': 0.0, 'decoder': 0.0, 'kl': 0.0, 'total': 0.0}
+    log_losses = {'prior': 0.0, 'decoder': 0.0, 'z_mean': 0.0, 'z_std': 0.0, 'total': 0.0}
     log_count  = 0
 
     optimizer.zero_grad()
@@ -460,8 +460,10 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
                 loss_factor=1.0,
             )
 
-            # KL[p(z_1|x) || N(0,I)]
-            loss_kl = kl_standard_normal(z_clean, latent_schedule)
+            # 监控潜变量的统计特性
+            # 直接观察 z_clean 的均值和标准差更能反映是否塌缩(std->0)或爆炸(std>>1)。
+            z_mean_val = z_clean.mean()
+            z_std_val  = z_clean.std()
 
             # ==========================================
             # 解码器损失（sigmoid reweighted ELBO）
@@ -482,7 +484,7 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
             # ==========================================
             # 总损失
             # ==========================================
-            loss = loss_prior + loss_kl + loss_dec
+            loss = loss_prior + loss_dec
 
         # 反传（梯度累积）
         is_accum_step = (step + 1) % args.grad_accum == 0
@@ -503,8 +505,9 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
         # 记录
         log_losses['prior']   += loss_prior.item()
         log_losses['decoder'] += loss_dec.item()
-        log_losses['kl']      += loss_kl.item()
         log_losses['total']   += loss.item()
+        log_losses['z_mean']  += z_mean_val.item()
+        log_losses['z_std']   += z_std_val.item()
         log_count += 1
 
         if (step + 1) % args.log_every == 0 and is_main:
@@ -519,7 +522,8 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
                 f"total={avg['total']:.4f} | "
                 f"prior={avg['prior']:.4f} | "
                 f"dec={avg['decoder']/args.loss_factor:.4f} (weighted: {avg['decoder']:.4f}) | "
-                f"kl={avg['kl']:.10f}"
+                f"z_mean={avg['z_mean']:.4f} | "
+                f"z_std={avg['z_std']:.4f}"
             )
             if args.wandb:
                 wandb.log({
@@ -527,7 +531,8 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
                     'loss/prior': avg['prior'],
                     'loss/decoder_weighted': avg['decoder'],
                     'loss/decoder': avg['decoder'] / args.loss_factor,
-                    'loss/kl': avg['kl'],
+                    'metric/z_mean': avg['z_mean'],
+                    'metric/z_std': avg['z_std'],
                     'lr': lr,
                 }, step=step + 1)
             log_losses = {k: 0.0 for k in log_losses}

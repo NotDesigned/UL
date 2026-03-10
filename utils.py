@@ -52,13 +52,13 @@ def loss_weight_sigmoid(log_snr: torch.Tensor, shift: float = 0.0) -> torch.Tens
     """
     Sigmoid reweighted ELBO 权重。
 
-    w(lambda_t) = sigmoid(lambda_t - shift)
+    w(lambda_t) = sigmoid(shift - lambda_t)
 
     效果：
-      - 高 log-SNR（低噪声）区域权重大：放大高 SNR 处本就较小的 MSE，
-        迫使编码器在潜变量中编码更多细节信息（anti posterior collapse）
-      - 低 log-SNR（高噪声）区域权重小：降低粗粒度去噪的损失比重，
-        该区域的学习主要由 exp(λ) ELBO 基础权重驱动
+      - 低 log-SNR（高噪声）区域权重小：
+        鼓励解码器在噪声较大的时间步承担任务。
+      - 高 log-SNR（低噪声）区域权重大：
+        鼓励将这些信息从编码器里传递。
 
     用于解码器（Decoder）的损失。与 loss_factor 配合，
     共同控制编码器的信息编码压力。
@@ -67,7 +67,7 @@ def loss_weight_sigmoid(log_snr: torch.Tensor, shift: float = 0.0) -> torch.Tens
         log_snr: 当前时间步的 log-SNR，shape [B]
         shift:   sigmoid 的偏移量，对应论文中的 bias b
     """
-    return torch.sigmoid(log_snr - shift)
+    return torch.sigmoid(shift - log_snr)
 
 def diffusion_loss(
     x_clean: torch.Tensor,
@@ -118,13 +118,13 @@ def diffusion_loss(
 
     return loss_factor * per_sample_loss.mean()
 
-def kl_standard_normal(z_clean: torch.Tensor, schedule: NoiseSchedule) -> torch.Tensor:
+def kl_standard_normal(z_clean: torch.Tensor, schedule: NoiseSchedule, t: float) -> torch.Tensor:
     """
-    KL[p(z_1|x) || N(0,I)] 的解析解。
-    实践中因为 lambda_1 很负，这项几乎为 0。
+    KL[p(z_t|x) || N(0,I)] 的解析解。
+    而实践中因为 lambda_t 很负，t=1时，这项几乎为 0。
     """
-    t_one = torch.ones(z_clean.shape[0], device=z_clean.device)
-    alpha1, sigma1 = schedule.alpha_sigma(t_one)
+    t_ = torch.full((z_clean.shape[0],), t, device=z_clean.device)
+    alpha1, sigma1 = schedule.alpha_sigma(t_)
 
     # 广播到 [B, 1, 1, 1] 以匹配 z_clean [B, C, H, W]
     view_shape = (-1,) + (1,) * (z_clean.dim() - 1)

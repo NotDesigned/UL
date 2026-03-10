@@ -29,7 +29,9 @@ torchrun --nproc_per_node=$NPROC_PER_NODE train.py --stage 1 --preset $PRESET --
   --effective_batch_size $EFFECTIVE_BATCH_SIZE \
   --save_every $SAVE_EVERY \
   --viz_every $VIZ_EVERY --log_every $LOG_EVERY \
-  --total_steps $TOTAL_STEPS_1 
+  --total_steps $TOTAL_STEPS_1 \
+  --loss_factor 1.6
+  # --resume ./runs/stage1/run_0015/ckpt_0409000.pt
 
 # ===== 阶段二：冻结编码器/解码器，训练 BaseModel =====
 # 自动查找阶段一最新的 run 目录
