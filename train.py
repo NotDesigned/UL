@@ -449,12 +449,14 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
             # ==========================================
             # 先验损失（unweighted ELBO）
             # ==========================================
+            z_0       = add_latent_noise(z_clean, latent_schedule)
+
             t_prior   = sample_timesteps(B, device)
-            z_t, _    = latent_schedule.forward_noise(z_clean, t_prior)
+            z_t, _    = latent_schedule.forward_noise(z_0, t_prior)
             z_hat     = prior(z_t, t_prior)
 
             loss_prior = diffusion_loss(
-                z_clean, z_hat, t_prior,
+                z_0, z_hat, t_prior,
                 schedule=latent_schedule,
                 weight_fn=loss_weight_unweighted,
                 loss_factor=1.0,
@@ -468,7 +470,6 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
             # ==========================================
             # 解码器损失（sigmoid reweighted ELBO）
             # ==========================================
-            z_0       = add_latent_noise(z_clean, latent_schedule)
 
             t_dec     = sample_timesteps(B, device)
             x_t, _    = image_schedule.forward_noise(x, t_dec)
@@ -738,7 +739,7 @@ def train_stage2(args, device: torch.device, rank: int, world_size: int, local_r
             loss = diffusion_loss(
                 z_0, z_hat, t,
                 schedule=latent_schedule,
-                weight_fn=lambda lam: loss_weight_sigmoid(lam, args.sigmoid_shift),
+                weight_fn=loss_weight_unweighted,
                 loss_factor=1.0,
             )
 
