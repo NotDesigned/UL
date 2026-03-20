@@ -1,6 +1,6 @@
 export OMP_NUM_THREADS=2
 NPROC_PER_NODE=1
-DATA_ROOT=~/datasets/mini-imagenet
+DATA_ROOT=~/datasets/afhq-parquet
 PRESET=small
 
 # === TRAIN ====
@@ -30,8 +30,8 @@ torchrun --nproc_per_node=$NPROC_PER_NODE train.py --stage 1 --preset $PRESET --
   --save_every $SAVE_EVERY \
   --viz_every $VIZ_EVERY --log_every $LOG_EVERY \
   --total_steps $TOTAL_STEPS_1 \
-  --loss_factor 1.6
-  # --resume ./runs/stage1/run_0015/ckpt_0409000.pt
+  --loss_factor 1.5 \
+  --resume ./runs/stage1/run_0022/ckpt_0001000.pt
 
 # ===== 阶段二：冻结编码器/解码器，训练 BaseModel =====
 # 自动查找阶段一最新的 run 目录
@@ -44,7 +44,8 @@ torchrun --nproc_per_node=$NPROC_PER_NODE train.py --stage 2 --preset $PRESET --
   --save_every $SAVE_EVERY \
   --viz_every $VIZ_EVERY --log_every $LOG_EVERY \
   --stage1_ckpt "$STAGE1_CKPT" \
-  --total_steps $TOTAL_STEPS_2
+  --total_steps $TOTAL_STEPS_2 \
+  --resume ./runs/stage2/run_0004/ckpt_0005000.pt
 
 # ===== 评测：gFID / rFID / PSNR =====
 STAGE2_RUN=$(ls -d ./runs/stage2/run_* 2>/dev/null | sort | tail -1)

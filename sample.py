@@ -77,16 +77,29 @@ def _run_diffusion_loop(
     n_steps:  int,
     eta:      float,
     device:   torch.device,
+    x_0:      torch.Tensor | None = None,   # 若提供，从加噪的 x_0 开始
+    start_t:  float               = 1.0,   # 起始时间步，1.0=纯噪声
 ) -> torch.Tensor:
     """
     通用扩散采样循环。
     model_fn 封装了模型调用（含条件），外部传入，内部不感知模型类型。
+
+    若提供 x_0 和 start_t < 1.0，则从 x_0 加噪到 start_t 开始去噪，
+    而非从纯噪声开始。用于 partial reconstruction 可视化。
     """
     B         = shape[0]
-    x         = torch.randn(*shape, device=device, dtype=torch.bfloat16)
-    timesteps = torch.linspace(1.0, 0.0, n_steps + 1).tolist()
+    # 时间步从 start_t 到 0
+    actual_steps = max(1, int(n_steps * start_t))
+    timesteps    = torch.linspace(start_t, 0.0, actual_steps + 1).tolist()
 
-    for i in range(n_steps):
+    if x_0 is not None and start_t < 1.0:
+        # 从加噪的 x_0 开始
+        t_start = torch.full((B,), start_t, device=device, dtype=torch.bfloat16)
+        x, _ = schedule.forward_noise(x_0.to(device=device, dtype=torch.bfloat16), t_start)
+    else:
+        x = torch.randn(*shape, device=device, dtype=torch.bfloat16)
+
+    for i in range(actual_steps):
         t_now  = timesteps[i]
         t_next = timesteps[i + 1]
         t_b    = torch.full((B,), t_now, device=device, dtype=torch.bfloat16)
@@ -140,10 +153,14 @@ def sample_images(
     sampler:        str  = 'ddim',
     resolution:     int  = 512,
     device:         torch.device = None,
+    x_0:            torch.Tensor | None = None,   # 若提供，从加噪的 x_0 开始
+    start_t:        float               = 1.0,   # 起始噪声级别
 ) -> torch.Tensor:
     """
     DiffusionDecoder 以 z_0 为条件采样图像。
     可在训练循环中直接调用。
+
+    若提供 x_0 和 start_t < 1.0，则从加噪的 x_0 开始部分去噪。
 
     Returns:
         images [B, 3, H, W]，值域 [-1, 1]
@@ -162,6 +179,8 @@ def sample_images(
         n_steps   = n_steps,
         eta       = eta,
         device    = device,
+        x_0       = x_0,
+        start_t   = start_t,
     )
     return images.clamp(-1, 1)
 
@@ -173,13 +192,18 @@ def reconstruct(
     images:          torch.Tensor,
     latent_schedule: NoiseSchedule,
     image_schedule:  NoiseSchedule,
-    n_steps:         int  = 50,
-    sampler:         str  = 'ddim',
+    n_steps:         int   = 50,
+    sampler:         str   = 'ddim',
+    start_t:         float = 1.0,    # 1.0=从纯噪声开始，<1.0=从加噪 x_0 开始
     device:          torch.device = None,
 ) -> torch.Tensor:
     """
     编码 → z_0 → 解码，用于重建质量评测（PSNR / rFID）。
     z_0 来自编码器而非 BaseModel，与生成路径完全独立。
+
+    start_t: 图像扩散的起始噪声级别。
+        1.0 = 从纯噪声开始（完整重建）
+        <1.0 = 从加噪的原图开始（partial reconstruction）
     """
     if device is None:
         device = next(encoder.parameters()).device
@@ -197,6 +221,8 @@ def reconstruct(
         n_steps=n_steps, sampler=sampler,
         resolution=images.shape[-1],
         device=device,
+        x_0=images if start_t < 1.0 else None,
+        start_t=start_t,
     )
 
 

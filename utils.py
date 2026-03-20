@@ -55,10 +55,10 @@ def loss_weight_sigmoid(log_snr: torch.Tensor, shift: float = 0.0) -> torch.Tens
     w(lambda_t) = sigmoid(shift - lambda_t)
 
     效果：
-      - 低 log-SNR（高噪声）区域权重小：
-        鼓励解码器在噪声较大的时间步承担任务。
-      - 高 log-SNR（低噪声）区域权重大：
-        鼓励将这些信息从编码器里传递。
+      - 低 log-SNR（高噪声）区域权重大：
+        让解码器专注于粗结构重建。
+      - 高 log-SNR（低噪声）区域权重小：
+        将细节信息的压力推给编码器通过 latent 传递。
 
     用于解码器（Decoder）的损失。与 loss_factor 配合，
     共同控制编码器的信息编码压力。
@@ -191,12 +191,10 @@ def get_latent_schedule() -> NoiseSchedule:
     """
     潜在空间的 noise schedule。
     
-    lambda_0 = 5   →  t=0 时 sigma ≈ 0.08（固定的小噪声）
+    lambda_0 = 0   →  t=0 时 sigma ≈ 0.08（固定的小噪声）
     lambda_1 = -20 →  t=1 时接近纯高斯噪声
-
-    这是 UL 论文的核心设定。
     """
-    return NoiseSchedule(lambda_0=5.0, lambda_1=-20.0)
+    return NoiseSchedule(lambda_0=0.0, lambda_1=-20.0)
 
 
 def get_image_schedule() -> NoiseSchedule:

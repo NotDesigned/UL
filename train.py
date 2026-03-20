@@ -45,7 +45,7 @@ PRESETS = {
         resolution=128,
         enc_channels='64,128,256',       # 3阶段 → 8× 下采样 → 16×16 latent
         dec_channels='64,128',           # 2阶段 → image 128→32 before ViT
-        latent_channels=16,
+        latent_channels=32,
         embed_dim=384,
         vit_blocks=4,
         vit_heads=6,
@@ -146,8 +146,8 @@ def get_args():
     # 可视化
     p.add_argument('--viz_every',    type=int,   default=5_000,
                    help='每隔多少步生成一次样本图（0=关闭）')
-    p.add_argument('--viz_n_samples',type=int,   default=16)
-    p.add_argument('--viz_steps',    type=int,   default=50,
+    p.add_argument('--viz_n_samples',type=int,   default=8)
+    p.add_argument('--viz_steps',    type=int,   default=100,
                    help='可视化采样步数，少一些以加快速度')
 
     # 日志与检查点
@@ -538,7 +538,9 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
             log_losses = {k: 0.0 for k in log_losses}
             log_count  = 0
 
-        # 训练中可视化（仅重建对比，阶段一的先验采样质量较差故省略）
+        # 训练中可视化（多噪声级别重建对比）
+        # 第一排：原图
+        # 后续排：start_t=1.0（纯噪声）、0.75、0.5、0.25 的重建结果
         if args.viz_every > 0 and (step + 1) % args.viz_every == 0 and is_main:
             viz_dir = os.path.join(args.output_dir, "viz")
             os.makedirs(viz_dir, exist_ok=True)
@@ -551,31 +553,37 @@ def train_stage1(args, device: torch.device, rank: int, world_size: int, local_r
             enc_raw.eval(); dec_raw.eval()
 
             viz_x = x[:args.viz_n_samples]
+            viz_start_ts = [1.0, 0.75, 0.5, 0.25]
+            rows = [viz_x]  # 第一排：原图
 
             with torch.no_grad():
-                imgs = reconstruct(
-                    encoder=enc_raw,
-                    decoder=dec_raw,
-                    images=viz_x,
-                    latent_schedule=latent_schedule,
-                    image_schedule=image_schedule,
-                    n_steps=args.viz_steps,
-                    sampler=args.sampler,
-                    device=device,
-                )
+                for st in viz_start_ts:
+                    imgs = reconstruct(
+                        encoder=enc_raw,
+                        decoder=dec_raw,
+                        images=viz_x,
+                        latent_schedule=latent_schedule,
+                        image_schedule=image_schedule,
+                        n_steps=args.viz_steps,
+                        sampler=args.sampler,
+                        start_t=st,
+                        device=device,
+                    )
+                    rows.append(imgs)
 
             ema_encoder.restore(enc_raw)
             ema_decoder.restore(dec_raw)
             enc_raw.train(); dec_raw.train()
 
-            comparison = torch.cat([viz_x, imgs], dim=0)
+            comparison = torch.cat(rows, dim=0)
             recon_grid = make_grid(
                 comparison.float().cpu() * 0.5 + 0.5,
                 nrow=viz_x.shape[0],
                 padding=2,
             )
             save_image(recon_grid, os.path.join(viz_dir, f"step_{step+1:07d}_recon.png"))
-            print(f"  [viz] 已保存重建对比网格 → {viz_dir}/step_{step+1:07d}_recon.png")
+            labels = ', '.join([f't={st}' for st in viz_start_ts])
+            print(f"  [viz] 已保存重建对比网格（原图, {labels}）→ {viz_dir}/step_{step+1:07d}_recon.png")
 
             if args.wandb:
                 wandb.log({
